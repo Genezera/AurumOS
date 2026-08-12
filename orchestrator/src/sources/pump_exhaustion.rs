@@ -4,10 +4,12 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::events::{DashboardEvent, EventBus};
+use crate::fusion::{recent_deposit_pressure_usd, recent_long_liquidation_cascade, LiquidationBoard, WhaleBoard};
 use crate::sources::SignalSource;
 use crate::types::{Direction, Market, Opportunity, Strategy};
 
@@ -53,6 +55,14 @@ const OI_HISTORY_MAX_WINDOW: Duration = Duration::from_secs(70 * 60);
 // confirmation_history depois de: 20min de janela de confirmação + 30min
 // de descanso = pelo menos ~50min entre amostras do mesmo símbolo.
 const EMIT_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+// Janela em que uma cascata de liquidação de longs no MESMO símbolo ainda
+// conta como reforço de fusão — mais curta que o cooldown acima, porque uma
+// cascata é um evento pontual, não um estado sustentado.
+const LIQUIDATION_FUSION_WINDOW: Duration = Duration::from_secs(15 * 60);
+// Depósito agregado em exchanges conhecidas (janela de 30min do próprio
+// Whale Watch) acima disso conta como pressão vendedora relevante o
+// suficiente pra reforçar um candidato de exaustão.
+const WHALE_FUSION_THRESHOLD_USD: f64 = 2_000_000.0;
 
 // --- Camada de confirmação por preço (roadmap Seção 0: "toda oportunidade
 // de ouro é tratada como hipótese, não fato... precisa de confirmação de
@@ -99,16 +109,20 @@ struct PendingConfirmation {
 /// estimado de cabeça. Ainda não é o detector completo descrito no PDF
 /// (falta desaceleração de compra agressiva, fluxo pra exchange).
 pub struct PumpExhaustionSource {
-    pub symbols: Vec<String>,
+    pub symbols_rx: watch::Receiver<Vec<String>>,
     pub bus: EventBus,
+    pub liquidation_board: LiquidationBoard,
+    pub whale_board: WhaleBoard,
 }
 
 impl PumpExhaustionSource {
-    pub fn new(symbols: Vec<&str>, bus: EventBus) -> Self {
-        Self {
-            symbols: symbols.into_iter().map(String::from).collect(),
-            bus,
-        }
+    pub fn new(
+        symbols_rx: watch::Receiver<Vec<String>>,
+        bus: EventBus,
+        liquidation_board: LiquidationBoard,
+        whale_board: WhaleBoard,
+    ) -> Self {
+        Self { symbols_rx, bus, liquidation_board, whale_board }
     }
 }
 
@@ -119,17 +133,25 @@ impl SignalSource for PumpExhaustionSource {
     }
 
     async fn run(&mut self, tx: Sender<Opportunity>) -> anyhow::Result<()> {
-        let symbols = self.symbols.clone();
         // Vive fora de run_once de propósito: uma queda de conexão (comum,
         // já tratada com reconexão automática) não pode apagar semanas de
         // histórico de confirmação acumulado — só ele que torna net_edge
-        // real possível.
+        // real possível. Sobrevive também à troca de universo de símbolos,
+        // pelo mesmo motivo.
         let mut confirmation_history: VecDeque<f64> = VecDeque::new();
         loop {
-            if let Err(e) = run_once(&symbols, &tx, &self.bus, &mut confirmation_history).await {
-                tracing::warn!(error = %e, "conexão de pump exhaustion (Bybit linear) caiu, reconectando em 3s");
+            let symbols = self.symbols_rx.borrow().clone();
+            tokio::select! {
+                result = run_once(&symbols, &tx, &self.bus, &mut confirmation_history, &self.liquidation_board, &self.whale_board) => {
+                    if let Err(e) = result {
+                        tracing::warn!(error = %e, "conexão de pump exhaustion (Bybit linear) caiu, reconectando em 3s");
+                    }
+                    sleep(Duration::from_secs(3)).await;
+                }
+                _ = self.symbols_rx.changed() => {
+                    tracing::info!("pump exhaustion: universo de símbolos atualizado — reconectando com lista nova");
+                }
             }
-            sleep(Duration::from_secs(3)).await;
         }
     }
 }
@@ -139,6 +161,8 @@ async fn run_once(
     tx: &Sender<Opportunity>,
     bus: &EventBus,
     confirmation_history: &mut VecDeque<f64>,
+    liquidation_board: &LiquidationBoard,
+    whale_board: &WhaleBoard,
 ) -> anyhow::Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(BYBIT_LINEAR_WS_URL).await?;
     let (mut sink, mut stream) = ws.split();
@@ -238,7 +262,7 @@ async fn run_once(
                 last_msg = Instant::now();
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
-                        handle_message(&text, &mut state, &mut last_emitted, tx, &mut pending_confirmations, confirmation_history).await;
+                        handle_message(&text, &mut state, &mut last_emitted, tx, &mut pending_confirmations, confirmation_history, liquidation_board, whale_board).await;
                     }
                     Some(Ok(WsMessage::Ping(p))) => { sink.send(WsMessage::Pong(p)).await?; }
                     Some(Ok(WsMessage::Close(_))) | None => anyhow::bail!("conexão fechada pelo servidor"),
@@ -287,6 +311,8 @@ async fn handle_message(
     tx: &Sender<Opportunity>,
     pending_confirmations: &mut Vec<PendingConfirmation>,
     confirmation_history: &VecDeque<f64>,
+    liquidation_board: &LiquidationBoard,
+    whale_board: &WhaleBoard,
 ) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -348,7 +374,21 @@ async fn handle_message(
     // as 3 obrigatoriamente — cada par (funding+pump, funding+OI, pump+OI)
     // já é um padrão de exaustão plausível sozinho.
     let signals_true = [funding_extreme, big_pump, oi_growing].iter().filter(|&&b| b).count();
-    if signals_true < 2 {
+
+    // Fusão (pedido do usuário, 13/08/2026 — "faça intercomunicação"):
+    // Whale Watch e Liquidation Hunter já coletam dado real do mesmo mercado
+    // mas ficavam isolados, sempre em net_edge=0. Exemplo dado pelo usuário:
+    // "pump + depósitos de whales em exchange + liquidações compradoras
+    // crescendo = candidato forte de exaustão". Uma cascata de liquidação de
+    // LONGS neste símbolo específico, ou pressão agregada de depósito em
+    // exchanges conhecidas (mercado geral), contam como reforço — com pelo
+    // menos 1 sinal próprio E 1 reforço externo, dispensa o 2º sinal próprio.
+    let fusion_liq = recent_long_liquidation_cascade(liquidation_board, symbol, LIQUIDATION_FUSION_WINDOW);
+    let fusion_whale_usd = recent_deposit_pressure_usd(whale_board);
+    let fusion_whale = fusion_whale_usd > WHALE_FUSION_THRESHOLD_USD;
+    let fusion_count = [fusion_liq, fusion_whale].iter().filter(|&&b| b).count();
+
+    if signals_true < 2 && !(signals_true >= 1 && fusion_count >= 1) {
         return;
     }
 
@@ -378,13 +418,25 @@ async fn handle_message(
         fired_at: Instant::now(),
     });
 
-    let (net_edge, confidence, confirmation_note) = match empirical_edge(confirmation_history) {
+    let (net_edge, base_confidence, confirmation_note) = match empirical_edge(confirmation_history) {
         Some((edge, conf)) => {
             let wins = confirmation_history.iter().filter(|&&m| m < 0.0).count();
             (edge, conf, format!("confirmação real: {wins}/{} acertos, edge médio {:+.2}%", confirmation_history.len(), edge * 100.0))
         }
         None => (0.0, 0.3, format!("aguardando confirmação ({}/{MIN_CONFIRMATION_SAMPLES} amostras)", confirmation_history.len())),
     };
+    // Reforço de fusão na confiança (nunca no net_edge — esse continua vindo
+    // só da confirmação de preço medida, não de um sinal de outro módulo).
+    // +15% por reforço confirmado, até +30% com os dois — nunca acima de
+    // 0,95 pra não fingir certeza absoluta.
+    let confidence = (base_confidence * (1.0 + 0.15 * fusion_count as f64)).min(0.95);
+    let fusion_note = match (fusion_liq, fusion_whale) {
+        (true, true) => " [fusão: cascata de longs + depósito em exchange]".to_string(),
+        (true, false) => " [fusão: cascata de liquidação de longs]".to_string(),
+        (false, true) => format!(" [fusão: depósito em exchange ${:.0}k/30min]", fusion_whale_usd / 1000.0),
+        (false, false) => String::new(),
+    };
+    let confirmation_note = format!("{confirmation_note}{fusion_note}");
 
     tracing::info!(
         symbol,

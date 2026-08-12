@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::{mpsc::Sender, RwLock};
+use tokio::sync::{mpsc::Sender, watch, RwLock};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -69,16 +69,13 @@ type BookMap = Arc<RwLock<HashMap<String, TopOfBook>>>;
 /// descontando taxas estimadas) supera `MIN_NET_EDGE`. Dado 100% real via
 /// WebSocket público — não precisa de chave de API para isso.
 pub struct ArbitrageSource {
-    pub symbols: Vec<String>,
+    pub symbols_rx: watch::Receiver<Vec<String>>,
     pub bus: EventBus,
 }
 
 impl ArbitrageSource {
-    pub fn new(symbols: Vec<&str>, bus: EventBus) -> Self {
-        Self {
-            symbols: symbols.into_iter().map(String::from).collect(),
-            bus,
-        }
+    pub fn new(symbols_rx: watch::Receiver<Vec<String>>, bus: EventBus) -> Self {
+        Self { symbols_rx, bus }
     }
 }
 
@@ -89,20 +86,34 @@ impl SignalSource for ArbitrageSource {
     }
 
     async fn run(&mut self, tx: Sender<Opportunity>) -> anyhow::Result<()> {
-        let bybit_books: BookMap = Arc::new(RwLock::new(HashMap::new()));
-        let bitget_books: BookMap = Arc::new(RwLock::new(HashMap::new()));
+        loop {
+            let symbols = self.symbols_rx.borrow().clone();
+            let bybit_books: BookMap = Arc::new(RwLock::new(HashMap::new()));
+            let bitget_books: BookMap = Arc::new(RwLock::new(HashMap::new()));
 
-        let symbols = self.symbols.clone();
-        let b1 = bybit_books.clone();
-        let syms1 = symbols.clone();
-        tokio::spawn(async move { run_bybit_forever(syms1, b1).await });
+            let b1 = bybit_books.clone();
+            let syms1 = symbols.clone();
+            let bybit_handle = tokio::spawn(async move { run_bybit_forever(syms1, b1).await });
 
-        let b2 = bitget_books.clone();
-        let syms2 = symbols.clone();
-        tokio::spawn(async move { run_bitget_forever(syms2, b2).await });
+            let b2 = bitget_books.clone();
+            let syms2 = symbols.clone();
+            let bitget_handle = tokio::spawn(async move { run_bitget_forever(syms2, b2).await });
 
-        run_comparator(symbols, bybit_books, bitget_books, tx, self.bus.clone()).await;
-        Ok(())
+            let tx2 = tx.clone();
+            let bus2 = self.bus.clone();
+            let comparator_handle = tokio::spawn(async move {
+                run_comparator(symbols, bybit_books, bitget_books, tx2, bus2).await
+            });
+
+            // As 3 tarefas rodam pra sempre sozinhas (cada uma já reconecta
+            // em erro internamente) — o único motivo pra voltar aqui é o
+            // universo de símbolos mudar, e aí reinicia tudo com a lista nova.
+            let _ = self.symbols_rx.changed().await;
+            tracing::info!("arbitragem: universo de símbolos atualizado — reiniciando conexões com lista nova");
+            bybit_handle.abort();
+            bitget_handle.abort();
+            comparator_handle.abort();
+        }
     }
 }
 

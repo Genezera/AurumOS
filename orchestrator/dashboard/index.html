@@ -393,6 +393,7 @@ const state = {
   halt: null,
   warn: null,
   macroCalendar: [],
+  symbolUniverse: { total: 0, top: [] },
   perStrategy: Object.fromEntries(STRATEGIES.map(s => [s.key, {
     received: 0, approved: 0, rejected: 0, wins: 0, losses: 0,
     pnl: 0, exposure: 0, lastEdge: null, lastConfidence: null,
@@ -702,6 +703,9 @@ function applyEvent(e, replay) {
   } else if (e.type === 'macro_calendar') {
     state.macroCalendar = e.events;
     if (!replay && state.activeTab === 'macro') renderMacroCalendar();
+  } else if (e.type === 'symbol_universe') {
+    state.symbolUniverse = { total: e.total, top: e.top };
+    if (!replay && state.activeTab === 'overview') renderSymbolUniverse();
   } else if (e.type === 'confluence') {
     makeMarker(e.ts_ms, state.overviewMarkers, {
       position: 'inBar',
@@ -920,6 +924,11 @@ function renderOverview() {
       <p class="hint">PnL acumulado recente e taxa de acerto por estratégia — clique num card pra abrir o detalhe.</p>
       <div class="pulse-grid" id="pulseGrid"></div>
     </div>
+    <div class="panel" style="margin-bottom:20px;">
+      <h2><span>Universo de símbolos — <span id="symbolUniverseCount">carregando…</span></span></h2>
+      <p class="hint">Rotação automática a cada 2h: mede edge real por símbolo (Order Flow), mantém os que comprovaram vantagem, e usa o resto das vagas pra explorar candidatos novos de toda a Bybit por volume — nunca fica travado na mesma lista.</p>
+      <div id="symbolUniverseList"></div>
+    </div>
     <div class="grid2">
       <div class="panel">
         <h2>Feed combinado — todas as estratégias</h2>
@@ -980,6 +989,7 @@ function renderOverview() {
   renderExposureTable();
   renderRiskCockpit();
   renderStrategyPulseGrid();
+  renderSymbolUniverse();
 }
 
 function renderOverviewTiles() {
@@ -1047,6 +1057,35 @@ function renderRiskCockpit() {
 // (motivacao direta: a analise de win rate desta sessao mostrou que PF
 // importa mais que win rate isolado, e isso só fica claro olhando os dois
 // juntos por estrategia).
+// Universo de símbolos dinâmico (pedido do usuário, 13/08/2026: "não quero
+// que fique travado no mesmo, quero uma análise inteira do mercado
+// inteiro"). Mostra o que o sistema decidiu vigiar agora e por quê — sem
+// isso a rotação automática seria invisível, uma lista mudando sozinha nos
+// bastidores sem ninguém saber.
+function renderSymbolUniverse() {
+  const el = document.getElementById('symbolUniverseList');
+  const countEl = document.getElementById('symbolUniverseCount');
+  if (!el) return;
+  const u = state.symbolUniverse;
+  if (countEl) countEl.textContent = u.total ? `${u.total} símbolos ativos` : 'aguardando primeira rotação…';
+  if (!u.top || !u.top.length) {
+    el.innerHTML = '<p class="empty-state">aguardando primeira rotação do universo de símbolos…</p>';
+    return;
+  }
+  el.innerHTML = `
+    <table class="data">
+      <thead><tr><th>Símbolo</th><th>Edge médio medido</th><th>Amostras</th></tr></thead>
+      <tbody>
+        ${u.top.map(r => `
+          <tr>
+            <td>${r.symbol}</td>
+            <td class="num ${r.mean_edge_pct > 0 ? 'pos-text' : ''}" style="color:${r.mean_edge_pct > 0 ? 'var(--green)' : 'var(--grey)'}">${r.mean_edge_pct >= 0 ? '+' : ''}${r.mean_edge_pct.toFixed(3)}%</td>
+            <td class="num">${r.samples}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
 function renderStrategyPulseGrid() {
   const grid = document.getElementById('pulseGrid');
   if (!grid) return;

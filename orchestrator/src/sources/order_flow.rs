@@ -4,11 +4,13 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::events::{DashboardEvent, EventBus};
 use crate::sources::{best_level, SignalSource};
+use crate::symbol_universe::{record_edge, EdgeScores};
 use crate::types::{Direction, Market, Opportunity, Strategy};
 
 const BYBIT_WS_URL: &str = "wss://stream.bybit.com/v5/public/spot";
@@ -43,16 +45,14 @@ const MIN_NET_EDGE: f64 = 0.0045;
 const EMIT_COOLDOWN: Duration = Duration::from_millis(700);
 
 pub struct OrderFlowSource {
-    pub symbols: Vec<String>,
+    pub symbols_rx: watch::Receiver<Vec<String>>,
     pub bus: EventBus,
+    pub edge_scores: EdgeScores,
 }
 
 impl OrderFlowSource {
-    pub fn new(symbols: Vec<&str>, bus: EventBus) -> Self {
-        Self {
-            symbols: symbols.into_iter().map(String::from).collect(),
-            bus,
-        }
+    pub fn new(symbols_rx: watch::Receiver<Vec<String>>, bus: EventBus, edge_scores: EdgeScores) -> Self {
+        Self { symbols_rx, bus, edge_scores }
     }
 }
 
@@ -63,17 +63,24 @@ impl SignalSource for OrderFlowSource {
     }
 
     async fn run(&mut self, tx: Sender<Opportunity>) -> anyhow::Result<()> {
-        let symbols = self.symbols.clone();
         loop {
-            if let Err(e) = run_once(&symbols, &tx, &self.bus).await {
-                tracing::warn!(error = %e, "conexão de order flow (Bybit) caiu, reconectando em 3s");
+            let symbols = self.symbols_rx.borrow().clone();
+            tokio::select! {
+                result = run_once(&symbols, &tx, &self.bus, &self.edge_scores) => {
+                    if let Err(e) = result {
+                        tracing::warn!(error = %e, "conexão de order flow (Bybit) caiu, reconectando em 3s");
+                    }
+                    sleep(Duration::from_secs(3)).await;
+                }
+                _ = self.symbols_rx.changed() => {
+                    tracing::info!("order flow: universo de símbolos atualizado — reconectando com lista nova");
+                }
             }
-            sleep(Duration::from_secs(3)).await;
         }
     }
 }
 
-async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus) -> anyhow::Result<()> {
+async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus, edge_scores: &EdgeScores) -> anyhow::Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(BYBIT_WS_URL).await?;
     let (mut sink, mut stream) = ws.split();
 
@@ -130,7 +137,7 @@ async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus) 
             msg = stream.next() => {
                 last_msg = Instant::now();
                 match msg {
-                    Some(Ok(WsMessage::Text(text))) => handle_message(&text, tx, &mut last_emitted, &mut last_diag, &mut best_seen, &mut snapshots).await,
+                    Some(Ok(WsMessage::Text(text))) => handle_message(&text, tx, &mut last_emitted, &mut last_diag, &mut best_seen, &mut snapshots, edge_scores).await,
                     Some(Ok(WsMessage::Ping(p))) => { sink.send(WsMessage::Pong(p)).await?; }
                     Some(Ok(WsMessage::Close(_))) | None => {
                         anyhow::bail!("conexão fechada pelo servidor");
@@ -150,6 +157,7 @@ async fn handle_message(
     last_diag: &mut HashMap<String, Instant>,
     best_seen: &mut HashMap<String, f64>,
     snapshots: &mut HashMap<String, SpreadSnapshot>,
+    edge_scores: &EdgeScores,
 ) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -176,6 +184,7 @@ async fn handle_message(
     let net_edge = spread_pct - 2.0 * MAKER_FEE;
     best_seen.insert(symbol.to_string(), net_edge);
     snapshots.insert(symbol.to_string(), SpreadSnapshot { bid: bid.0, ask: ask.0, net_edge });
+    record_edge(edge_scores, symbol, net_edge);
 
     let should_diag = last_diag
         .get(symbol)

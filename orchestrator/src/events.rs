@@ -138,6 +138,21 @@ pub enum DashboardEvent {
     /// o frontend calcula a contagem regressiva ao vivo a partir daí.
     #[serde(rename = "macro_calendar")]
     MacroCalendar { events: Vec<MacroCalendarEntry> },
+    /// Universo de símbolos dinâmico (13/08/2026) — emitido a cada rotação
+    /// (padrão: a cada 2h) pra o painel mostrar o que está sendo observado
+    /// agora e por quê, em vez de uma lista fixa invisível.
+    #[serde(rename = "symbol_universe")]
+    SymbolUniverse {
+        total: usize,
+        top: Vec<SymbolRanking>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolRanking {
+    pub symbol: String,
+    pub mean_edge_pct: f64,
+    pub samples: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +272,10 @@ impl DashboardEvent {
 
     pub fn macro_calendar(events: Vec<MacroCalendarEntry>) -> Self {
         DashboardEvent::MacroCalendar { events }
+    }
+
+    pub fn symbol_universe(total: usize, top: Vec<SymbolRanking>) -> Self {
+        DashboardEvent::SymbolUniverse { total, top }
     }
 
     pub fn risk_config(cfg: &RiskConfig) -> Self {

@@ -4,10 +4,12 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::events::{DashboardEvent, EventBus};
+use crate::fusion::{record_cascade, LiquidationBoard};
 use crate::sources::SignalSource;
 use crate::types::{Direction, Market, Opportunity, Strategy};
 
@@ -44,16 +46,14 @@ struct LiqEvent {
 /// (informativo, nunca opera sozinho) até passar por validação histórica
 /// de verdade (Fase 10 do roadmap).
 pub struct LiquidationHunterSource {
-    pub symbols: Vec<String>,
+    pub symbols_rx: watch::Receiver<Vec<String>>,
     pub bus: EventBus,
+    pub liquidation_board: LiquidationBoard,
 }
 
 impl LiquidationHunterSource {
-    pub fn new(symbols: Vec<&str>, bus: EventBus) -> Self {
-        Self {
-            symbols: symbols.into_iter().map(String::from).collect(),
-            bus,
-        }
+    pub fn new(symbols_rx: watch::Receiver<Vec<String>>, bus: EventBus, liquidation_board: LiquidationBoard) -> Self {
+        Self { symbols_rx, bus, liquidation_board }
     }
 }
 
@@ -64,17 +64,24 @@ impl SignalSource for LiquidationHunterSource {
     }
 
     async fn run(&mut self, tx: Sender<Opportunity>) -> anyhow::Result<()> {
-        let symbols = self.symbols.clone();
         loop {
-            if let Err(e) = run_once(&symbols, &tx, &self.bus).await {
-                tracing::warn!(error = %e, "conexão de liquidation hunter (Bybit) caiu, reconectando em 3s");
+            let symbols = self.symbols_rx.borrow().clone();
+            tokio::select! {
+                result = run_once(&symbols, &tx, &self.bus, &self.liquidation_board) => {
+                    if let Err(e) = result {
+                        tracing::warn!(error = %e, "conexão de liquidation hunter (Bybit) caiu, reconectando em 3s");
+                    }
+                    sleep(Duration::from_secs(3)).await;
+                }
+                _ = self.symbols_rx.changed() => {
+                    tracing::info!("liquidation hunter: universo de símbolos atualizado — reconectando com lista nova");
+                }
             }
-            sleep(Duration::from_secs(3)).await;
         }
     }
 }
 
-async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus) -> anyhow::Result<()> {
+async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus, liquidation_board: &LiquidationBoard) -> anyhow::Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(BYBIT_LINEAR_WS_URL).await?;
     let (mut sink, mut stream) = ws.split();
 
@@ -120,7 +127,7 @@ async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus) 
                 last_msg = Instant::now();
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
-                        total_seen += handle_message(&text, &mut windows, &mut last_emitted, tx).await;
+                        total_seen += handle_message(&text, &mut windows, &mut last_emitted, tx, liquidation_board).await;
                     }
                     Some(Ok(WsMessage::Ping(p))) => { sink.send(WsMessage::Pong(p)).await?; }
                     Some(Ok(WsMessage::Close(_))) | None => anyhow::bail!("conexão fechada pelo servidor"),
@@ -137,6 +144,7 @@ async fn handle_message(
     windows: &mut HashMap<String, VecDeque<LiqEvent>>,
     last_emitted: &mut HashMap<String, Instant>,
     tx: &Sender<Opportunity>,
+    liquidation_board: &LiquidationBoard,
 ) -> u64 {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -196,6 +204,11 @@ async fn handle_message(
         last_emitted.insert(symbol.to_string(), Instant::now());
 
         let liquidated_longs = side; // Buy = posição comprada sendo liquidada
+        // Comunica pro Pump Exhaustion via quadro compartilhado — pedido do
+        // usuário de "fazer intercomunicação": uma cascata de liquidação de
+        // longs no mesmo símbolo é um dos três sinais do exemplo de fusão
+        // ("liquidações compradoras crescendo = candidato forte de exaustão").
+        record_cascade(liquidation_board, symbol, liquidated_longs, same_side_count);
         tracing::info!(
             symbol,
             liquidated_longs,

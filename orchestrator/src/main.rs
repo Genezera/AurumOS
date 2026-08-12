@@ -1,9 +1,11 @@
 mod dashboard;
 mod events;
+mod fusion;
 mod orchestrator;
 mod raw_log;
 mod risk;
 mod sources;
+mod symbol_universe;
 mod types;
 
 use std::net::SocketAddr;
@@ -132,10 +134,31 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, rx) = mpsc::channel(256);
 
+    // Universo de símbolos dinâmico (13/08/2026, pedido do usuário: "não
+    // quero que fique travado no mesmo, quero uma análise inteira do
+    // mercado inteiro"). Nasce com WIDE_SYMBOLS como semente (evita perder
+    // cobertura no boot) e se recalcula sozinho — ver symbol_universe.rs.
+    // `watch::channel` porque cada fonte só precisa da lista MAIS RECENTE,
+    // nunca do histórico de mudanças.
+    let seed_symbols: Vec<String> = WIDE_SYMBOLS.iter().map(|s| s.to_string()).collect();
+    let (symbols_tx, symbols_rx) = tokio::sync::watch::channel(seed_symbols.clone());
+    let edge_scores = symbol_universe::new_edge_scores();
+    let symbol_universe_handle = {
+        let scores = edge_scores.clone();
+        let su_bus = bus.clone();
+        tokio::spawn(async move { symbol_universe::run(scores, symbols_tx, seed_symbols, su_bus).await })
+    };
+
+    // Quadros de fusão (pedido do usuário: "faça a fusão", "faça
+    // intercomunicação") — Whale Watch e Liquidation Hunter alimentam,
+    // Pump Exhaustion lê como reforço de confiança. Ver fusion.rs.
+    let liquidation_board = fusion::new_liquidation_board();
+    let whale_board = fusion::new_whale_board();
+
     // Arbitragem (Fase 1): book público da Bybit e da Bitget via WebSocket,
     // sem precisar de chave de API.
     let arb_tx = tx.clone();
-    let mut arbitrage = ArbitrageSource::new(WIDE_SYMBOLS.to_vec(), bus.clone());
+    let mut arbitrage = ArbitrageSource::new(symbols_rx.clone(), bus.clone());
     let arbitrage_handle = tokio::spawn(async move {
         if let Err(e) = arbitrage.run(arb_tx).await {
             tracing::error!(error = %e, "fonte de arbitragem encerrou com erro");
@@ -146,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
     // dentro de UMA exchange (captura de spread como maker) em vez de entre
     // duas exchanges.
     let of_tx = tx.clone();
-    let mut order_flow = OrderFlowSource::new(WIDE_SYMBOLS.to_vec(), bus.clone());
+    let mut order_flow = OrderFlowSource::new(symbols_rx.clone(), bus.clone(), edge_scores.clone());
     let order_flow_handle = tokio::spawn(async move {
         if let Err(e) = order_flow.run(of_tx).await {
             tracing::error!(error = %e, "fonte de order flow encerrou com erro");
@@ -157,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
     // visibilidade por enquanto (net_edge=0 sempre) — ver comentário em
     // whale_watch.rs sobre por que isso nunca dispara ordem sozinho.
     let ww_tx = tx.clone();
-    let mut whale_watch = WhaleWatchSource;
+    let mut whale_watch = WhaleWatchSource::new(whale_board.clone());
     let whale_watch_handle = tokio::spawn(async move {
         if let Err(e) = whale_watch.run(ww_tx).await {
             tracing::error!(error = %e, "fonte de whale watch encerrou com erro");
@@ -181,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
     // uma fatia do detector completo do roadmap, e por isso também sai só
     // como visibilidade (net_edge=0) até passar por backtest de verdade.
     let pe_tx = tx.clone();
-    let mut pump_exhaustion = PumpExhaustionSource::new(WIDE_SYMBOLS.to_vec(), bus.clone());
+    let mut pump_exhaustion = PumpExhaustionSource::new(symbols_rx.clone(), bus.clone(), liquidation_board.clone(), whale_board.clone());
     let pump_exhaustion_handle = tokio::spawn(async move {
         if let Err(e) = pump_exhaustion.run(pe_tx).await {
             tracing::error!(error = %e, "fonte de pump exhaustion encerrou com erro");
@@ -227,7 +250,7 @@ async fn main() -> anyhow::Result<()> {
     // allLiquidation. Módulo do roadmap original que ainda não tinha sido
     // construído — ver comentário em liquidation_hunter.rs.
     let lh_tx = tx.clone();
-    let mut liquidation_hunter = LiquidationHunterSource::new(WIDE_SYMBOLS.to_vec(), bus.clone());
+    let mut liquidation_hunter = LiquidationHunterSource::new(symbols_rx.clone(), bus.clone(), liquidation_board.clone());
     let liquidation_hunter_handle = tokio::spawn(async move {
         if let Err(e) = liquidation_hunter.run(lh_tx).await {
             tracing::error!(error = %e, "fonte de liquidation hunter encerrou com erro");
@@ -251,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
     let final_state =
         orchestrator::run(rx, cfg, max_cycles, Duration::from_millis(150), bus, state_path, kill_file_path, reset_drawdown_file_path).await;
 
+    symbol_universe_handle.abort();
     arbitrage_handle.abort();
     order_flow_handle.abort();
     whale_watch_handle.abort();

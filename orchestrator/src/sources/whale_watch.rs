@@ -6,6 +6,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::fusion::{record_deposit, WhaleBoard};
 use crate::sources::SignalSource;
 use crate::types::{Direction, Market, Opportunity, Strategy};
 
@@ -76,7 +77,15 @@ fn known_label(address: &str) -> Option<&'static str> {
 /// isso automaticamente. O valor agora é visibilidade em tempo real no
 /// dashboard; virar sinal acionável exige a camada de confirmação por
 /// preço/livro que essa fase ainda não tem.
-pub struct WhaleWatchSource;
+pub struct WhaleWatchSource {
+    pub whale_board: WhaleBoard,
+}
+
+impl WhaleWatchSource {
+    pub fn new(whale_board: WhaleBoard) -> Self {
+        Self { whale_board }
+    }
+}
 
 #[async_trait::async_trait]
 impl SignalSource for WhaleWatchSource {
@@ -86,7 +95,7 @@ impl SignalSource for WhaleWatchSource {
 
     async fn run(&mut self, tx: Sender<Opportunity>) -> anyhow::Result<()> {
         loop {
-            if let Err(e) = run_once(&tx).await {
+            if let Err(e) = run_once(&tx, &self.whale_board).await {
                 tracing::warn!(error = %e, "conexão com nó Ethereum caiu, reconectando em 5s");
             }
             sleep(Duration::from_secs(5)).await;
@@ -94,7 +103,7 @@ impl SignalSource for WhaleWatchSource {
     }
 }
 
-async fn run_once(tx: &Sender<Opportunity>) -> anyhow::Result<()> {
+async fn run_once(tx: &Sender<Opportunity>, whale_board: &WhaleBoard) -> anyhow::Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(eth_ws_url()).await?;
     let (mut sink, mut stream) = ws.split();
 
@@ -135,7 +144,7 @@ async fn run_once(tx: &Sender<Opportunity>) -> anyhow::Result<()> {
                     first_messages_logged += 1;
                     tracing::debug!(raw = %text.chars().take(400).collect::<String>(), "mensagem bruta do nó (diagnóstico)");
                 }
-                handle_message(&text, tx).await;
+                handle_message(&text, tx, whale_board).await;
             }
             WsMessage::Close(_) => anyhow::bail!("conexão fechada pelo servidor"),
             _ => {}
@@ -143,7 +152,7 @@ async fn run_once(tx: &Sender<Opportunity>) -> anyhow::Result<()> {
     }
 }
 
-async fn handle_message(text: &str, tx: &Sender<Opportunity>) {
+async fn handle_message(text: &str, tx: &Sender<Opportunity>, whale_board: &WhaleBoard) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return,
@@ -184,6 +193,12 @@ async fn handle_message(text: &str, tx: &Sender<Opportunity>) {
     let to = extract_address(topics.get(2));
     let from_label = known_label(&from);
     let to_label = known_label(&to);
+    if to_label.is_some() {
+        // Depósito em exchange conhecida — alimenta o quadro de fusão que o
+        // Pump Exhaustion lê como reforço de confiança (pressão vendedora
+        // agregada de mercado, ver fusion.rs).
+        record_deposit(whale_board, amount_usd);
+    }
 
     tracing::info!(token, amount_usd, from = %from, to = %to, ?from_label, ?to_label, "movimento de baleia detectado");
 
