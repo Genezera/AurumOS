@@ -91,3 +91,15 @@ min_recent_profit_factor_for_scale = 1.2
 # menor que min_cycles_between_scale de propósito, pra não virar um segundo
 # gargalo redundante.
 min_recent_samples_for_scale = 30
+# Recuperação parcial (12/08/2026): fração do maior drawdown LOCAL da
+# própria estratégia (pico→vale de PnL acumulado) que precisa estar
+# recuperada antes de liberar escalonamento — substitui a exigência antiga
+# de equity do PORTFÓLIO INTEIRO bater novo pico, que travava uma
+# estratégia individualmente lucrativa só porque outra ainda não recuperou.
+partial_recovery_fraction = 0.80
+# Fração do Kelly cheio realmente aplicada ao tamanho da perna (Kelly
+# fracionário, 12/08/2026) — Kelly cheio maximiza crescimento assumindo
+# taxa de acerto/payoff exatos e conhecidos, o que nunca é o caso com
+# amostra finita; uma fração conservadora mantém a maior parte do
+# crescimento perdendo bem menos robustez.
+kelly_safety_fraction = 0.30

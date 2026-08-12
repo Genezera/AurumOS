@@ -23,6 +23,18 @@ pub struct ScalingConfig {
     /// verdade nesse trecho recente.
     pub min_recent_profit_factor_for_scale: f64,
     pub min_recent_samples_for_scale: usize,
+    /// Recuperação parcial (revisão pós-fusão, 12/08/2026): fração do maior
+    /// drawdown LOCAL (pico→vale de PnL acumulado) que uma estratégia
+    /// precisa recuperar antes de poder escalonar — substitui a exigência
+    /// antiga de `equity >= peak_equity` (pico de TODO o portfólio), que
+    /// travava uma estratégia individualmente lucrativa só porque outra
+    /// ainda não tinha recuperado.
+    pub partial_recovery_fraction: f64,
+    /// Fração do Kelly cheio realmente aplicada ao tamanho da perna (Kelly
+    /// fracionário) — Kelly cheio assume p/b exatos e conhecidos, o que
+    /// nunca é o caso com amostra finita e ruidosa; uma fração (ex. 0.3)
+    /// mantém a maior parte do crescimento perdendo bem menos robustez.
+    pub kelly_safety_fraction: f64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -91,9 +103,7 @@ pub struct PortfolioState {
     /// restart não deve ser uma forma acidental de destravar o nível mais
     /// grave de proteção.
     pub total_drawdown_latched: bool,
-    pub leg_size: f64,
     pub total_cycles: u64,
-    pub cycles_since_scale: u32,
     pub exposure_by_strategy: HashMap<Strategy, f64>,
     pub exposure_by_group: HashMap<String, f64>,
     pub last_outcome_by_strategy: HashMap<Strategy, TradeOutcome>,
@@ -101,13 +111,46 @@ pub struct PortfolioState {
     pub wins: u64,
     pub losses: u64,
     pub rejections: u64,
-    /// Janela móvel dos últimos PnLs (todas as estratégias) — usada pelo
-    /// gate de escalonamento (revisão técnica externa, 13/08/2026: "exigir
-    /// também EV móvel positivo, profit factor mínimo" antes de aumentar a
-    /// perna, não só ciclos + drawdown baixo). Não persiste entre restarts
-    /// de propósito — é um filtro de qualidade recente, não capital real;
-    /// perdê-la só significa esperar a janela reencher, inofensivo.
+    /// Escalonamento por estratégia (pedido do usuário, 12/08/2026: "cada
+    /// estratégia rastreia seu próprio PnL acumulado, pico e leg_size —
+    /// ganha o direito de crescer pelo próprio histórico, não pelo pico do
+    /// portfólio inteiro"). Substitui o antigo `leg_size`/`recent_pnls`/
+    /// `cycles_since_scale` globais únicos. Sempre populado com todas as
+    /// `Strategy::ALL` — `leg_size()` nunca deveria precisar de fallback.
+    pub strategy_scaling: HashMap<Strategy, StrategyScaling>,
+}
+
+/// Estado de escalonamento de UMA estratégia — perna operacional, PnL
+/// acumulado (não equity, que é do portfólio inteiro) e a janela móvel de
+/// resultados recentes usada pelos gates de profit factor/robustez.
+#[derive(Debug, Clone)]
+pub struct StrategyScaling {
+    pub leg_size: f64,
+    pub cumulative_pnl: f64,
+    pub peak_cumulative_pnl: f64,
+    /// Menor `cumulative_pnl` visto desde o último novo pico — junto com
+    /// `peak_cumulative_pnl`, define o tamanho do drawdown local usado pela
+    /// recuperação parcial (`ScalingConfig::partial_recovery_fraction`).
+    pub trough_since_peak: f64,
+    pub cycles_since_scale: u32,
+    /// Janela móvel dos últimos PnLs DESSA estratégia — não persiste entre
+    /// restarts de propósito (mesmo raciocínio do campo global antigo:
+    /// filtro de qualidade recente, não capital; perdê-la só significa
+    /// esperar a janela reencher).
     pub recent_pnls: VecDeque<f64>,
+}
+
+impl StrategyScaling {
+    fn new(initial_leg_size: f64) -> Self {
+        Self {
+            leg_size: initial_leg_size,
+            cumulative_pnl: 0.0,
+            peak_cumulative_pnl: 0.0,
+            trough_since_peak: 0.0,
+            cycles_since_scale: 0,
+            recent_pnls: VecDeque::new(),
+        }
+    }
 }
 
 /// Só os campos que fazem sentido sobreviver a um restart do processo —
@@ -132,12 +175,27 @@ struct PersistedState {
     week_start_epoch_week: i64,
     #[serde(default)]
     total_drawdown_latched: bool,
+    /// Campo do formato antigo (leg_size global único) — mantido só como
+    /// semente pra estratégias sem entrada própria em `strategy_scaling`
+    /// num arquivo salvo antes desta revisão (12/08/2026). Novos saves
+    /// sempre populam `strategy_scaling` e este campo vira só um eco dele.
+    #[serde(default)]
     leg_size: f64,
     total_cycles: u64,
-    cycles_since_scale: u32,
+    #[serde(default)]
+    strategy_scaling: HashMap<String, StrategyScalingPersisted>,
     wins: u64,
     losses: u64,
     rejections: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StrategyScalingPersisted {
+    leg_size: f64,
+    cumulative_pnl: f64,
+    peak_cumulative_pnl: f64,
+    trough_since_peak: f64,
+    cycles_since_scale: u32,
 }
 
 impl PortfolioState {
@@ -152,9 +210,7 @@ impl PortfolioState {
             week_start_equity: cfg.total_equity_start,
             week_start_epoch_week: today_epoch_week(),
             total_drawdown_latched: false,
-            leg_size: cfg.initial_leg_size,
             total_cycles: 0,
-            cycles_since_scale: 0,
             exposure_by_strategy: HashMap::new(),
             exposure_by_group: HashMap::new(),
             last_outcome_by_strategy: HashMap::new(),
@@ -162,8 +218,22 @@ impl PortfolioState {
             wins: 0,
             losses: 0,
             rejections: 0,
-            recent_pnls: VecDeque::new(),
+            strategy_scaling: Strategy::ALL
+                .iter()
+                .map(|&s| (s, StrategyScaling::new(cfg.initial_leg_size)))
+                .collect(),
         }
+    }
+
+    /// Tamanho da perna operacional da estratégia — 0.0 nunca deveria
+    /// acontecer de verdade (`strategy_scaling` é sempre populado com todas
+    /// as `Strategy::ALL`), mas o fallback evita pânico se um novo valor de
+    /// `Strategy` for adicionado sem passar por `new()`/`load_or_new()`.
+    pub fn leg_size(&self, strategy: Strategy) -> f64 {
+        self.strategy_scaling
+            .get(&strategy)
+            .map(|s| s.leg_size)
+            .unwrap_or(0.0)
     }
 
     /// Tenta recuperar o estado salvo em `path`; se não existir ou estiver
@@ -217,12 +287,35 @@ impl PortfolioState {
             week_start_equity,
             week_start_epoch_week,
             total_drawdown_latched: persisted.total_drawdown_latched,
-            leg_size: persisted.leg_size,
             total_cycles: persisted.total_cycles,
-            cycles_since_scale: persisted.cycles_since_scale,
             wins: persisted.wins,
             losses: persisted.losses,
             rejections: persisted.rejections,
+            strategy_scaling: Strategy::ALL
+                .iter()
+                .map(|&s| {
+                    let scaling = match persisted.strategy_scaling.get(s.key()) {
+                        Some(sc) => StrategyScaling {
+                            leg_size: sc.leg_size,
+                            cumulative_pnl: sc.cumulative_pnl,
+                            peak_cumulative_pnl: sc.peak_cumulative_pnl,
+                            trough_since_peak: sc.trough_since_peak,
+                            cycles_since_scale: sc.cycles_since_scale,
+                            recent_pnls: VecDeque::new(),
+                        },
+                        // Save de antes desta revisão (12/08/2026): não tem
+                        // strategy_scaling nenhum ainda — usa o leg_size
+                        // global antigo como semente pra todas, em vez de
+                        // reiniciar em cfg.initial_leg_size (perderia
+                        // escalonamento já conquistado).
+                        None if persisted.leg_size > 0.0 => {
+                            StrategyScaling::new(persisted.leg_size)
+                        }
+                        None => StrategyScaling::new(cfg.initial_leg_size),
+                    };
+                    (s, scaling)
+                })
+                .collect(),
             ..fresh
         }
     }
@@ -241,9 +334,32 @@ impl PortfolioState {
             week_start_equity: self.week_start_equity,
             week_start_epoch_week: self.week_start_epoch_week,
             total_drawdown_latched: self.total_drawdown_latched,
-            leg_size: self.leg_size,
+            // Eco do maior leg_size entre estratégias — só pra servir de
+            // semente em `load_or_new` se um save mais antigo (ver `None`
+            // acima) precisar dele; a fonte da verdade é sempre
+            // `strategy_scaling` abaixo.
+            leg_size: self
+                .strategy_scaling
+                .values()
+                .map(|s| s.leg_size)
+                .fold(0.0, f64::max),
             total_cycles: self.total_cycles,
-            cycles_since_scale: self.cycles_since_scale,
+            strategy_scaling: self
+                .strategy_scaling
+                .iter()
+                .map(|(s, sc)| {
+                    (
+                        s.key().to_string(),
+                        StrategyScalingPersisted {
+                            leg_size: sc.leg_size,
+                            cumulative_pnl: sc.cumulative_pnl,
+                            peak_cumulative_pnl: sc.peak_cumulative_pnl,
+                            trough_since_peak: sc.trough_since_peak,
+                            cycles_since_scale: sc.cycles_since_scale,
+                        },
+                    )
+                })
+                .collect(),
             wins: self.wins,
             losses: self.losses,
             rejections: self.rejections,
@@ -431,7 +547,7 @@ pub fn evaluate(
         return Err(RejectReason::LeverageTooHigh);
     }
 
-    let order_size = opp.capital_needed.min(portfolio.leg_size);
+    let order_size = opp.capital_needed.min(portfolio.leg_size(opp.strategy));
 
     // Nunca aumentar o tamanho da ordem em uma estratégia logo após uma perda.
     if portfolio.last_outcome_by_strategy.get(&opp.strategy) == Some(&TradeOutcome::Loss) {
@@ -483,6 +599,11 @@ pub enum ScaleDirection {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScaleEvent {
+    /// `None` = ajuste portfolio-wide (redução de segurança por drawdown
+    /// total), aplicado a todas as estratégias de uma vez — ver
+    /// `halve_all_legs`. `Some` = ajuste de uma estratégia específica
+    /// (aumento por Kelly fracionário, task #99).
+    pub strategy: Option<Strategy>,
     pub old_size: f64,
     pub new_size: f64,
     pub direction: ScaleDirection,
@@ -495,7 +616,7 @@ pub fn record_trade_result(
     approved: &Approved,
     outcome: TradeOutcome,
     pnl: f64,
-) -> Option<ScaleEvent> {
+) -> Vec<ScaleEvent> {
     portfolio.equity += pnl;
     if pnl > 0.0 {
         // Divisão de lucro depende do tipo de estratégia — ver
@@ -538,15 +659,33 @@ pub fn record_trade_result(
         .insert(opp.strategy, approved.order_size);
 
     portfolio.total_cycles += 1;
-    portfolio.cycles_since_scale += 1;
+
+    // Bookkeeping por estratégia (task #97): PnL acumulado, pico e vale
+    // desde o pico (usados pela recuperação parcial, task #98) e a janela
+    // móvel de PnLs recentes DESSA estratégia (profit factor/robustez já
+    // não são mais compartilhados entre estratégias diferentes — uma
+    // estratégia ruim não trava mais o escalonamento de uma boa, e
+    // vice-versa).
+    let scaling = portfolio
+        .strategy_scaling
+        .entry(opp.strategy)
+        .or_insert_with(|| StrategyScaling::new(cfg.initial_leg_size));
+    scaling.cumulative_pnl += pnl;
+    if scaling.cumulative_pnl > scaling.peak_cumulative_pnl {
+        scaling.peak_cumulative_pnl = scaling.cumulative_pnl;
+        scaling.trough_since_peak = scaling.cumulative_pnl;
+    } else {
+        scaling.trough_since_peak = scaling.trough_since_peak.min(scaling.cumulative_pnl);
+    }
+    scaling.cycles_since_scale += 1;
 
     const RECENT_PNLS_CAP: usize = 200;
-    portfolio.recent_pnls.push_back(pnl);
-    while portfolio.recent_pnls.len() > RECENT_PNLS_CAP {
-        portfolio.recent_pnls.pop_front();
+    scaling.recent_pnls.push_back(pnl);
+    while scaling.recent_pnls.len() > RECENT_PNLS_CAP {
+        scaling.recent_pnls.pop_front();
     }
 
-    maybe_scale(portfolio, cfg)
+    maybe_scale(portfolio, cfg, opp.strategy)
 }
 
 /// Profit factor (soma dos ganhos / soma das perdas) da janela móvel
@@ -578,68 +717,144 @@ fn positive_excluding_best_trade(recent_pnls: &VecDeque<f64>, min_samples: usize
     Some(total - best.max(0.0) > 0.0)
 }
 
-/// Ajusta o tamanho da perna operacional: reduz pela metade em drawdown
-/// relevante, aumenta gradualmente quando a operação está em nova máxima,
-/// estável há tempo suficiente e sem drawdown recente. Retorna o que mudou
-/// para que o chamador possa anotar isso no dashboard (marcador no gráfico).
-fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig) -> Option<ScaleEvent> {
-    portfolio.peak_equity = portfolio.peak_equity.max(portfolio.equity);
-    let drawdown = portfolio.drawdown_pct();
-
-    if drawdown >= cfg.scaling.drawdown_halve_threshold_pct {
-        let old_size = portfolio.leg_size;
-        let new_size = (portfolio.leg_size / 2.0).max(1.0);
-        portfolio.cycles_since_scale = 0;
+/// Reduz a perna de TODAS as estratégias pela metade — gatilho de segurança
+/// portfolio-wide (aviso preventivo de drawdown diário, ou drawdown desde o
+/// pico ultrapassando `drawdown_halve_threshold_pct`). Diferente do aumento
+/// (que é por estratégia — task #97), a redução de emergência continua
+/// global de propósito: um drawdown de portfólio é sinal de que TODAS as
+/// estratégias devem operar menor agora, não só a que "causou" o problema —
+/// nenhuma delas tem como saber sozinha que o portfólio inteiro está em
+/// apuros.
+pub fn halve_all_legs(portfolio: &mut PortfolioState) -> Vec<ScaleEvent> {
+    let mut events = Vec::new();
+    for (&strategy, scaling) in portfolio.strategy_scaling.iter_mut() {
+        let old_size = scaling.leg_size;
+        let new_size = (old_size / 2.0).max(1.0);
+        scaling.cycles_since_scale = 0;
         if new_size < old_size {
-            tracing::warn!(
-                drawdown_pct = drawdown * 100.0,
-                old_leg_size = old_size,
-                new_leg_size = new_size,
-                "drawdown acima do limite: reduzindo perna pela metade"
-            );
-            portfolio.leg_size = new_size;
-            return Some(ScaleEvent {
+            scaling.leg_size = new_size;
+            events.push(ScaleEvent {
+                strategy: Some(strategy),
                 old_size,
                 new_size,
                 direction: ScaleDirection::Decrease,
             });
         }
+    }
+    events
+}
+
+/// Sizing contínuo estilo Kelly fracionário (task #99): em vez do degrau
+/// fixo antigo (`leg_size * scale_growth_factor`), o tamanho-alvo da perna é
+/// recalculado a cada aumento a partir da fração de Kelly medida na janela
+/// recente de trades DESSA estratégia — `p` = taxa de acerto, `b` = ganho
+/// médio / perda média, `kelly = p - (1-p)/b`. Aplica só uma fração de
+/// segurança do Kelly cheio (`kelly_safety_fraction`) porque o Kelly cheio
+/// maximiza crescimento assumindo p/b exatos e conhecidos — nunca o caso
+/// com amostra finita e ruidosa; Kelly fracionário é a forma padrão de
+/// manter a maior parte do crescimento perdendo bem menos robustez.
+/// `None` quando não há amostra dos dois lados (só vitórias ou só perdas
+/// na janela) ou quando o Kelly medido é <= 0 — a própria matemática
+/// dizendo "não aposte mais aqui ainda", não um caso de fallback silencioso.
+fn kelly_target_size(scaling: &StrategyScaling, cfg: &RiskConfig, equity: f64) -> Option<f64> {
+    let wins: Vec<f64> = scaling.recent_pnls.iter().copied().filter(|&p| p > 0.0).collect();
+    let losses: Vec<f64> = scaling.recent_pnls.iter().copied().filter(|&p| p < 0.0).map(f64::abs).collect();
+    if wins.is_empty() || losses.is_empty() {
         return None;
     }
-
-    let at_new_peak = portfolio.equity >= portfolio.peak_equity;
-    let enough_cycles = portfolio.cycles_since_scale >= cfg.scaling.min_cycles_between_scale;
-    let low_drawdown = drawdown < cfg.scaling.max_drawdown_pct_for_scale;
-    // Ciclos + drawdown baixo sozinhos não provam que a estratégia está
-    // lucrando de verdade nesse trecho recente — exige também profit
-    // factor mínimo na janela móvel (None = amostra pequena demais ainda,
-    // trata como "não comprovado", não escala).
-    let profit_factor = recent_profit_factor(&portfolio.recent_pnls, cfg.scaling.min_recent_samples_for_scale);
-    let profit_factor_ok = profit_factor.map(|pf| pf >= cfg.scaling.min_recent_profit_factor_for_scale).unwrap_or(false);
-    // Não escala se o resultado da janela depende de uma única operação
-    // excepcional — remove o melhor trade e exige que o saldo continue
-    // positivo mesmo assim.
-    let robust_without_best = positive_excluding_best_trade(&portfolio.recent_pnls, cfg.scaling.min_recent_samples_for_scale).unwrap_or(false);
-
-    if at_new_peak && enough_cycles && low_drawdown && profit_factor_ok && robust_without_best {
-        let old_size = portfolio.leg_size;
-        let max_leg = portfolio.equity * cfg.scaling.max_leg_fraction_of_equity;
-        let new_size = (portfolio.leg_size * cfg.scaling.scale_growth_factor).min(max_leg);
-        portfolio.cycles_since_scale = 0;
-        if new_size > old_size {
-            tracing::info!(
-                old_leg_size = old_size,
-                new_leg_size = new_size,
-                equity = portfolio.equity,
-                "condições de escalonamento atendidas: aumentando perna"
-            );
-            portfolio.leg_size = new_size;
-            return Some(ScaleEvent {
-                old_size,
-                new_size,
-                direction: ScaleDirection::Increase,
-            });
-        }
+    let total = scaling.recent_pnls.len() as f64;
+    let win_rate = wins.len() as f64 / total;
+    let avg_win = wins.iter().sum::<f64>() / wins.len() as f64;
+    let avg_loss = losses.iter().sum::<f64>() / losses.len() as f64;
+    if avg_loss <= 0.0 {
+        return None;
     }
-    None
+    let payoff_ratio = avg_win / avg_loss;
+    let kelly_fraction = win_rate - (1.0 - win_rate) / payoff_ratio;
+    if kelly_fraction <= 0.0 {
+        return None;
+    }
+    Some(equity * kelly_fraction * cfg.scaling.kelly_safety_fraction)
+}
+
+/// Decide se a perna operacional de UMA estratégia pode crescer. Gate de
+/// segurança portfolio-wide primeiro (drawdown desde o pico do equity
+/// inteiro — se estourou, reduz TUDO e nem avalia aumento). Senão, avalia
+/// só o histórico dessa estratégia: recuperação parcial do próprio
+/// drawdown local (task #98, substitui o antigo `at_new_peak` de equity
+/// inteiro), ciclos mínimos, profit factor e robustez-sem-melhor-trade na
+/// própria janela recente — e, se tudo passar, tamanha pelo Kelly
+/// fracionário medido (task #99), com fallback pro degrau fixo antigo só
+/// quando a amostra ainda não dá pra estimar Kelly (ex.: só vitórias até
+/// agora).
+fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strategy) -> Vec<ScaleEvent> {
+    portfolio.peak_equity = portfolio.peak_equity.max(portfolio.equity);
+    let drawdown = portfolio.drawdown_pct();
+
+    if drawdown >= cfg.scaling.drawdown_halve_threshold_pct {
+        let events = halve_all_legs(portfolio);
+        if !events.is_empty() {
+            tracing::warn!(
+                drawdown_pct = drawdown * 100.0,
+                count = events.len(),
+                "drawdown acima do limite: reduzindo perna de todas as estrategias pela metade"
+            );
+        }
+        return events;
+    }
+
+    let equity = portfolio.equity;
+    let Some(scaling) = portfolio.strategy_scaling.get_mut(&strategy) else {
+        return Vec::new();
+    };
+
+    let enough_cycles = scaling.cycles_since_scale >= cfg.scaling.min_cycles_between_scale;
+    let low_drawdown = drawdown < cfg.scaling.max_drawdown_pct_for_scale;
+
+    // Recuperação parcial (task #98): em vez de exigir `cumulative_pnl` no
+    // pico exato — o antigo `at_new_peak` comparava o EQUITY DO PORTFÓLIO
+    // inteiro, travando uma estratégia individualmente lucrativa só porque
+    // outra ainda não tinha recuperado — basta recuperar
+    // `partial_recovery_fraction` do maior drawdown LOCAL (pico→vale de
+    // PnL acumulado) já sofrido por essa estratégia especificamente.
+    let peak_to_trough = scaling.peak_cumulative_pnl - scaling.trough_since_peak;
+    let recovered = if peak_to_trough <= 0.0 {
+        true
+    } else {
+        let recovered_fraction = 1.0 - (scaling.peak_cumulative_pnl - scaling.cumulative_pnl) / peak_to_trough;
+        recovered_fraction >= cfg.scaling.partial_recovery_fraction
+    };
+
+    let profit_factor = recent_profit_factor(&scaling.recent_pnls, cfg.scaling.min_recent_samples_for_scale);
+    let profit_factor_ok = profit_factor.map(|pf| pf >= cfg.scaling.min_recent_profit_factor_for_scale).unwrap_or(false);
+    let robust_without_best = positive_excluding_best_trade(&scaling.recent_pnls, cfg.scaling.min_recent_samples_for_scale).unwrap_or(false);
+
+    if !(recovered && enough_cycles && low_drawdown && profit_factor_ok && robust_without_best) {
+        return Vec::new();
+    }
+
+    let old_size = scaling.leg_size;
+    let max_leg = equity * cfg.scaling.max_leg_fraction_of_equity;
+    let target_size = kelly_target_size(scaling, cfg, equity).unwrap_or(old_size * cfg.scaling.scale_growth_factor);
+    let new_size = target_size.min(max_leg).max(1.0);
+    scaling.cycles_since_scale = 0;
+
+    if (new_size - old_size).abs() < 0.01 {
+        return Vec::new();
+    }
+
+    tracing::info!(
+        strategy = strategy.key(),
+        old_leg_size = old_size,
+        new_leg_size = new_size,
+        equity,
+        "condições de escalonamento atendidas: ajustando perna (Kelly fracionário)"
+    );
+    scaling.leg_size = new_size;
+    vec![ScaleEvent {
+        strategy: Some(strategy),
+        old_size,
+        new_size,
+        direction: if new_size > old_size { ScaleDirection::Increase } else { ScaleDirection::Decrease },
+    }]
 }

@@ -46,7 +46,9 @@ pub enum DashboardEvent {
         protected_reserve: f64,
         infra_reserve: f64,
         total_equity: f64,
-        leg_size: f64,
+        /// Perna por estratégia (task #97 — não é mais um único valor
+        /// global). `(strategy_key, leg_size)`.
+        leg_sizes: Vec<(String, f64)>,
         // Drawdown desde o pico histórico (all-time) — mesma métrica que o
         // kill-switch compara contra total_drawdown_halt_pct. Nome mantido
         // por compatibilidade; diario/semanal são campos separados abaixo.
@@ -85,6 +87,9 @@ pub enum DashboardEvent {
     /// marcador anotado direto no gráfico de equity.
     #[serde(rename = "leg_resized")]
     LegResized {
+        /// `None` = ajuste portfolio-wide (redução de segurança). `Some` =
+        /// perna de uma estratégia específica (task #97).
+        strategy: Option<String>,
         old_size: f64,
         new_size: f64,
         direction: String,
@@ -215,7 +220,11 @@ impl DashboardEvent {
             protected_reserve: p.protected_reserve,
             infra_reserve: p.infra_reserve,
             total_equity: p.equity + p.protected_reserve + p.infra_reserve,
-            leg_size: p.leg_size,
+            leg_sizes: p
+                .strategy_scaling
+                .iter()
+                .map(|(s, sc)| (s.key().to_string(), sc.leg_size))
+                .collect(),
             drawdown_pct: p.drawdown_pct() * 100.0,
             daily_drawdown_pct: p.daily_drawdown_pct() * 100.0,
             weekly_drawdown_pct: p.weekly_drawdown_pct() * 100.0,
@@ -234,6 +243,7 @@ impl DashboardEvent {
 
     pub fn leg_resized(scale: ScaleEvent, equity_at_event: f64) -> Self {
         DashboardEvent::LegResized {
+            strategy: scale.strategy.map(|s| s.key().to_string()),
             old_size: scale.old_size,
             new_size: scale.new_size,
             direction: match scale.direction {

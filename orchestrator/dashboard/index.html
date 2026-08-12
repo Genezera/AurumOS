@@ -423,7 +423,7 @@ function resetClientState() {
   state.warn = null;
   state.perStrategy = Object.fromEntries(STRATEGIES.map(s => [s.key, {
     received: 0, approved: 0, rejected: 0, wins: 0, losses: 0,
-    pnl: 0, exposure: 0, lastEdge: null, lastConfidence: null,
+    pnl: 0, exposure: 0, legSize: 0, lastEdge: null, lastConfidence: null,
     feed: [], markers: [], lastPnlSecond: null, heartbeat: null,
   }]));
   delete state.__equityPoints;
@@ -625,8 +625,9 @@ function describeEvent(e) {
   }
   if (e.type === 'leg_resized') {
     const verb = e.direction === 'increase' ? 'aumentou' : 'reduziu';
+    const who = e.strategy ? (STRAT_BY_KEY[e.strategy] || { label: e.strategy }).label : 'todas as estratégias';
     return { cls: 'scale', kind: 'scale', asset: '—', time,
-      html: `<span class="main"><span class="icon">${ICONS.scale}</span><b>Risk Engine</b> ${verb} a perna: ${fmtUsd(e.old_size)} → ${fmtUsd(e.new_size)}</span><span class="time">${time}</span>` };
+      html: `<span class="main"><span class="icon">${ICONS.scale}</span><b>Risk Engine</b> ${verb} a perna de <b>${who}</b>: ${fmtUsd(e.old_size)} → ${fmtUsd(e.new_size)}</span><span class="time">${time}</span>` };
   }
   if (e.type === 'confluence') {
     const names = e.strategies.map(k => (STRAT_BY_KEY[k] || { label: k }).label).join(' + ');
@@ -693,11 +694,15 @@ function applyEvent(e, replay) {
       text: (e.direction === 'increase' ? '⇧ ' : '⇩ ') + fmtUsd(e.new_size),
     });
     const d = describeEvent(e);
-    pushCapped(state.overviewFeed, { ...d, strategy: '__system__' }, FEED_CAP);
+    pushCapped(state.overviewFeed, { ...d, strategy: e.strategy || '__system__' }, FEED_CAP);
+    if (e.strategy && state.perStrategy[e.strategy]) {
+      pushCapped(state.perStrategy[e.strategy].feed, d, FEED_CAP);
+    }
   } else if (e.type === 'portfolio_snapshot') {
     state.latestSnapshot = e;
     recordEquityPoint(state.__equityPoints || (state.__equityPoints = []), e.ts_ms, e.equity);
     e.exposure_by_strategy.forEach(([k, v]) => { if (state.perStrategy[k]) state.perStrategy[k].exposure = v; });
+    (e.leg_sizes || []).forEach(([k, v]) => { if (state.perStrategy[k]) state.perStrategy[k].legSize = v; });
   } else if (e.type === 'risk_config') {
     state.riskConfig = e;
   } else if (e.type === 'macro_calendar') {
@@ -894,7 +899,7 @@ function renderOverview() {
       <div class="tile"><div class="label">Reserva protegida</div><div class="value" id="t-reserve" data-raw="0">—</div></div>
       <div class="tile"><div class="label">Reserva infra (eventos raros)</div><div class="value" id="t-infra" data-raw="0">—</div></div>
       <div class="tile"><div class="label">Patrimônio total</div><div class="value" id="t-total" data-raw="0">—</div></div>
-      <div class="tile"><div class="label">Tamanho da perna</div><div class="value" id="t-leg" data-raw="0">—</div></div>
+      <div class="tile"><div class="label">Perna total (soma por estratégia)</div><div class="value" id="t-leg" data-raw="0">—</div></div>
       <div class="tile"><div class="label">Drawdown (do pico)</div><div class="value" id="t-dd" data-raw="0">—</div></div>
       <div class="tile"><div class="label">Ciclos</div><div class="value" id="t-cycles" data-raw="0">—</div></div>
       <div class="tile"><div class="label">Win rate</div><div class="value" id="t-winrate" data-raw="0">—</div></div>
@@ -1008,7 +1013,7 @@ function renderOverviewTiles() {
   setTile('t-reserve', snap.protected_reserve, fmtUsd);
   setTile('t-infra', snap.infra_reserve, fmtUsd);
   setTile('t-total', snap.total_equity, fmtUsd);
-  setTile('t-leg', snap.leg_size, fmtUsd);
+  setTile('t-leg', (snap.leg_sizes || []).reduce((sum, [, v]) => sum + v, 0), fmtUsd);
   setTile('t-dd', snap.drawdown_pct, fmtPct, snap.drawdown_pct > 1 ? 'neg' : '');
   setTile('t-cycles', snap.total_cycles, v => Math.round(v).toString());
   setTile('t-winrate', snap.win_rate_pct, fmtPct, snap.win_rate_pct >= 50 ? 'pos' : 'neg');
@@ -1108,6 +1113,7 @@ function renderStrategyPulseGrid() {
           <span>win <b>${winRate === null ? '—' : winRate.toFixed(0) + '%'}</b></span>
           <span>sinais <b>${s.received}</b></span>
           <span>trades <b>${total}</b></span>
+          <span>perna <b>${fmtUsd(s.legSize)}</b></span>
         </div>
       </div>`;
   }).join('');
@@ -1143,6 +1149,7 @@ function updateStrategyKpis(key) {
   setKpi('k-winrate', fmtPct(winRate));
   setKpi('k-pnl', fmtUsd(s.pnl));
   setKpi('k-exposure', fmtUsd(s.exposure));
+  setKpi('k-legsize', fmtUsd(s.legSize));
   const pnlTile = document.getElementById('k-pnl');
   if (pnlTile) pnlTile.className = 'v ' + (s.pnl >= 0 ? 'pos' : 'neg');
 
@@ -1231,6 +1238,7 @@ function renderStrategyTab(key) {
       <div class="kpi"><div class="l">Win rate</div><div class="v" id="k-winrate">0%</div></div>
       <div class="kpi"><div class="l">PnL acumulado</div><div class="v" id="k-pnl">$0.00</div></div>
       <div class="kpi"><div class="l">Exposição atual</div><div class="v" id="k-exposure">$0.00</div></div>
+      <div class="kpi"><div class="l">Perna operacional</div><div class="v" id="k-legsize">$0.00</div></div>
     </div>
     <div class="panel" style="margin-bottom:16px;">
       <h2>PnL acumulado — ${meta.label}</h2>

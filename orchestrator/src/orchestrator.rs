@@ -138,15 +138,12 @@ pub async fn run(
                     // preserva capacidade de composição sem esperar o bloqueio
                     // rígido do dia seguinte.
                     if is_warned {
-                        let old_size = portfolio.leg_size;
-                        let new_size = (old_size / 2.0).max(1.0);
-                        if new_size < old_size {
-                            portfolio.leg_size = new_size;
-                            tracing::warn!(old_size, new_size, "aviso preventivo: reduzindo perna pela metade");
-                            bus.emit(DashboardEvent::leg_resized(
-                                risk::ScaleEvent { old_size, new_size, direction: risk::ScaleDirection::Decrease },
-                                portfolio.equity,
-                            ));
+                        let scale_events = risk::halve_all_legs(&mut portfolio);
+                        if !scale_events.is_empty() {
+                            tracing::warn!(count = scale_events.len(), "aviso preventivo: reduzindo perna de todas as estrategias pela metade");
+                            for scale in scale_events {
+                                bus.emit(DashboardEvent::leg_resized(scale, portfolio.equity));
+                            }
                         }
                     }
                     bus.emit(DashboardEvent::risk_warning(kill_status.warn));
@@ -337,11 +334,11 @@ fn execute(
         execution_note,
         pnl,
         equity_after = portfolio.equity + pnl,
-        leg_size = portfolio.leg_size,
+        leg_size = portfolio.leg_size(opp.strategy),
         "ordem simulada executada"
     );
 
-    let scale_event = risk::record_trade_result(portfolio, cfg, opp, &approved, outcome, pnl);
+    let scale_events = risk::record_trade_result(portfolio, cfg, opp, &approved, outcome, pnl);
 
     bus.emit(DashboardEvent::trade_result(
         opp.strategy,
@@ -350,7 +347,7 @@ fn execute(
         pnl,
         portfolio.equity,
     ));
-    if let Some(scale) = scale_event {
+    for scale in scale_events {
         bus.emit(DashboardEvent::leg_resized(scale, portfolio.equity));
     }
     bus.emit(DashboardEvent::portfolio_snapshot(portfolio));

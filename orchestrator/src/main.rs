@@ -297,7 +297,7 @@ async fn main() -> anyhow::Result<()> {
         equity_final = final_state.equity,
         reserva_protegida = final_state.protected_reserve,
         patrimonio_total = final_state.equity + final_state.protected_reserve,
-        leg_size_final = final_state.leg_size,
+        maior_leg_size_final = final_state.strategy_scaling.values().map(|s| s.leg_size).fold(0.0, f64::max),
         ciclos = final_state.total_cycles,
         wins = final_state.wins,
         losses = final_state.losses,

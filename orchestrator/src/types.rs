@@ -22,6 +22,21 @@ pub enum Strategy {
 }
 
 impl Strategy {
+    /// Todas as variantes — usada pra inicializar/reidratar estruturas que
+    /// precisam de um estado por estratégia (ex.: `risk::StrategyScaling`)
+    /// sem depender de uma crate de enum-iteração externa.
+    pub const ALL: [Strategy; 9] = [
+        Strategy::Arbitrage,
+        Strategy::OrderFlow,
+        Strategy::News,
+        Strategy::Launch,
+        Strategy::PumpExhaustion,
+        Strategy::WhaleWatch,
+        Strategy::Macro,
+        Strategy::LiquidationHunter,
+        Strategy::MultiAsset,
+    ];
+
     /// Chave usada para casar com as tabelas do config/risk.toml.
     pub fn key(&self) -> &'static str {
         match self {
