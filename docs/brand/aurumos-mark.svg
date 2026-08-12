@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">AurumOS mark</title>
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FFE29A"/><stop offset=".48" stop-color="#F5C453"/><stop offset="1" stop-color="#B87916"/></linearGradient></defs>
+  <path d="M68 432C142 387 212 291 277 157l-35 17 72-107 38 124-31-22C256 311 183 403 112 449Z" fill="url(#g)"/>
+  <path d="M78 398c44-38 85-93 126-165l-27 15 55-82 29 95-24-17c-39 69-82 126-126 168Z" fill="url(#g)"/>
+  <path d="M91 357c25-24 50-57 74-98l-20 10 42-61 21 71-17-13c-23 40-47 74-72 101Z" fill="url(#g)"/>
+  <path d="M318 250 438 445h-77l-83-133Z" fill="url(#g)"/>
+  <path d="M99 425c73-58 136-146 198-276" fill="none" stroke="#18D7FF" stroke-width="7" stroke-linecap="round"/>
+</svg>
+

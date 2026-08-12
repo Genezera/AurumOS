@@ -1,0 +1,23 @@
+# Segredos — nunca versionar
+orchestrator/.env
+*.env
+**/*.env
+
+# Build artifacts (Rust)
+target/
+Cargo.lock.bak
+
+# Estado de runtime (dado, não código) — cresce sem limite, não faz sentido versionar
+orchestrator/data/
+backtests/reports/*.json
+backtests/reports/*.md
+
+# Logs de sessão
+*.log
+orchestrator_stdout*.log
+orchestrator_stderr*.log
+whale_watch_rescan.log
+
+# Python
+__pycache__/
+*.pyc

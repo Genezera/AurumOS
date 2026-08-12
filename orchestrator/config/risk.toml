@@ -1,0 +1,93 @@
+# Configuração de capital e risco do AurumOS.
+# Estes números vieram da conversa de planejamento inicial (base US$200,
+# US$100 em cada exchange) e são um PONTO DE PARTIDA para paper trading —
+# devem ser recalibrados com dados reais antes de qualquer uso com dinheiro.
+
+total_equity_start = 200.0
+
+# Fração do lucro de cada ciclo positivo que vai para reserva protegida
+# em vez de ser reinvestida no capital operacional. Vale para as
+# estratégias "contínuas" (Arbitragem, Order Flow) — ver Strategy::is_rare_event.
+protected_reserve_pct = 0.20
+reinvest_pct = 0.80
+
+# Divisão de 3 vias específica para lucro de estratégias de "evento raro"
+# (Launch Radar, Whale Watch, News, Macro, Pump Exhaustion, Liquidation
+# Hunter): 70% reinvestido (implícito, o que sobra), 20% reserva protegida,
+# 10% pra uma reserva de infraestrutura/custos — essas estratégias são
+# esporádicas por natureza, então uma fatia menor fica disponível pra
+# reinvestir imediatamente.
+rare_event_reserve_pct = 0.20
+rare_event_infra_pct = 0.10
+
+# Tamanho inicial de uma "perna" de operação (ordem por estratégia).
+initial_leg_size = 25.0
+
+# Risco total simultâneo somando todas as estratégias.
+total_risk_pct = 0.0050
+
+# Kill-switch automático em camadas (Fase 12) — revisado após auditoria
+# técnica externa (13/08/2026): 5% diário era alto demais para microcapital.
+# Complementa, não substitui, o drawdown_halve_threshold_pct abaixo (que
+# reduz o tamanho da perna, mas por si só não para o sistema).
+#
+# Preventivo: emite aviso no dashboard E reduz a perna pela metade (ver
+# orchestrator.rs, transição do aviso) — NÃO bloqueia novas execuções.
+daily_warn_pct = 0.01
+# Bloqueio rígido diário: para novas execuções até o dia seguinte (UTC) ou
+# até ser destravado manualmente (ver data/KILL). Reduzido de 2% para 1,5%
+# (2ª revisão técnica externa, 13/08/2026) — pra US$200 e o objetivo de
+# preservar capacidade de composição, 2% era generoso demais.
+daily_halt_pct = 0.015
+# Bloqueio semanal: mesmo mecanismo, janela de 7 dias corridos — pega
+# drawdown que se acumula devagar ao longo de vários dias sem nenhum deles
+# isoladamente bater o limite diário.
+weekly_halt_pct = 0.04
+# Bloqueio por drawdown total (desde o pico histórico de todos os tempos,
+# não só do dia/semana atual) — rede de segurança final. Diferente dos
+# outros 3 níveis, este NÃO se libera sozinho quando o equity recupera —
+# exige confirmação manual explícita (ver risk.rs::kill_switch_reason e
+# data/RESET_DRAWDOWN_HALT), por ser o nível mais grave.
+total_drawdown_halt_pct = 0.07
+
+# Risco máximo (capital em risco / equity total) que cada estratégia pode
+# ter aberto simultaneamente.
+[strategy_risk_pct]
+arbitrage = 0.0035
+order_flow = 0.0025
+news = 0.0015
+launch = 0.0010
+pump_exhaustion = 0.0025
+whale_watch = 0.0020
+macro = 0.0020
+liquidation_hunter = 0.0020
+multi_asset = 0.0015
+
+[leverage]
+# Nenhuma alavancagem em lançamentos de tokens (livro/liquidez não confiáveis).
+launch_max = 1.0
+# Alavancagem máxima em instrumentos líquidos (arbitragem, macro, order flow).
+liquid_max = 2.0
+
+[scaling]
+# Ciclos mínimos desde o último aumento de perna antes de permitir outro.
+min_cycles_between_scale = 50
+# Drawdown máximo (fração do pico de equity) permitido para autorizar escalonamento.
+max_drawdown_pct_for_scale = 0.02
+# Se o drawdown a partir do pico ultrapassar isso, a perna é reduzida pela metade.
+drawdown_halve_threshold_pct = 0.02
+# Fator de crescimento aplicado à perna quando as condições de escalonamento são atendidas.
+scale_growth_factor = 1.15
+# Fração máxima do equity total que uma única perna pode representar.
+max_leg_fraction_of_equity = 0.30
+# Profit factor mínimo (janela móvel dos últimos trades) exigido — além de
+# ciclos+drawdown baixo — pra autorizar escalonamento. Elevado de 1.1 para
+# 1.2 (2ª revisão técnica externa, 13/08/2026): 1.1 é frágil demais contra
+# ruído/custos — some fácil com uma única operação ruim. Combinado agora
+# com a checagem de "resultado ainda positivo removendo o melhor trade"
+# (risk.rs::positive_excluding_best_trade), não só o profit factor bruto.
+min_recent_profit_factor_for_scale = 1.2
+# Amostra mínima na janela móvel antes do profit factor contar pra algo —
+# menor que min_cycles_between_scale de propósito, pra não virar um segundo
+# gargalo redundante.
+min_recent_samples_for_scale = 30
