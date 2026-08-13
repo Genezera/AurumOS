@@ -596,13 +596,24 @@ async fn maybe_emit(
     // Registra a hipótese pra ser conferida contra o book real daqui a
     // CONFIRMATION_WINDOW — acontece sempre que o gate de fee é cruzado,
     // independente de já ter amostra suficiente pra confiar.
+    //
+    // Deduplicação por cluster de evento (auditoria externa, 13/08/2026,
+    // mesmo raciocínio do Order Flow): EMIT_COOLDOWN (700ms) é menor que
+    // CONFIRMATION_WINDOW (2s) — sem isso, o mesmo spread sobrevivendo por
+    // alguns segundos gerava múltiplas confirmações sobrepostas pro mesmo
+    // (símbolo, direção), autocorrelacionadas mas contadas como amostras
+    // independentes. Só uma confirmação em voo por (símbolo, direção) por
+    // vez.
     let (net_edge, confidence, confirmation_note, sampled_return) = {
         let mut guard = confirmation.lock().unwrap();
-        guard.pending.push(PendingConfirmation {
-            symbol: symbol.to_string(),
-            direction: direction_key,
-            fired_at: Instant::now(),
-        });
+        let already_pending = guard.pending.iter().any(|p| p.symbol == symbol && p.direction == direction_key);
+        if !already_pending {
+            guard.pending.push(PendingConfirmation {
+                symbol: symbol.to_string(),
+                direction: direction_key,
+                fired_at: Instant::now(),
+            });
+        }
         // Reamostragem real (auditoria externa, 13/08/2026): sorteia um
         // desfecho que REALMENTE aconteceu no histórico de confirmação,
         // em vez de deixar o orquestrador decidir por sorteio ponderado

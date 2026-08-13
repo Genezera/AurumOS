@@ -710,10 +710,7 @@ pub fn evaluate(
     // oportunidade recebe mais ou menos conforme seu próprio Kelly medido
     // — ver symbol_allocation_fraction. Símbolo novo/pouco visto herda
     // 100% do orçamento da estratégia (fração 1.0), nunca começa zerado.
-    let symbol_fraction = symbol_allocation_fraction(
-        portfolio.symbol_scaling.get(&(opp.strategy, opp.base_symbol().to_string())),
-        portfolio.strategy_scaling.get(&opp.strategy),
-    );
+    let symbol_fraction = symbol_allocation_fraction(portfolio, opp.strategy, opp.base_symbol());
     let leg_size = portfolio.leg_size(opp.strategy)
         * drawdown_ceiling_multiplier(portfolio.drawdown_pct())
         * symbol_fraction;
@@ -1008,7 +1005,28 @@ fn drawdown_ceiling_multiplier(drawdown: f64) -> f64 {
     }
 }
 
-/// Fração de Kelly cheio (`p - (1-p)/b`, `p`=taxa de acerto, `b`=ganho
+/// Limite inferior de confiança (Wilson score, 95%) pra uma proporção
+/// binomial — protege contra excesso de confiança em amostra pequena:
+/// 3 vitórias em 4 tentativas "parece" 75%, mas o LCB real fica bem mais
+/// perto de 30%; conforme a amostra cresce, o LCB converge pro valor
+/// pontual. Auditoria externa (13/08/2026): "Kelly com taxa de acerto
+/// pontual superestima sistematicamente o tamanho seguro da aposta
+/// quando a amostra ainda é pequena — precisa de um LCB estatístico."
+fn wilson_lower_bound(wins: f64, total: f64) -> f64 {
+    if total <= 0.0 {
+        return 0.0;
+    }
+    const Z: f64 = 1.96; // 95% de confiança
+    let p_hat = wins / total;
+    let z2 = Z * Z;
+    let denom = 1.0 + z2 / total;
+    let center = p_hat + z2 / (2.0 * total);
+    let margin = Z * ((p_hat * (1.0 - p_hat) / total) + z2 / (4.0 * total * total)).sqrt();
+    ((center - margin) / denom).max(0.0)
+}
+
+/// Fração de Kelly cheio (`p_LCB - (1-p_LCB)/b`, `p_LCB`=limite inferior
+/// de confiança da taxa de acerto — não a taxa pontual — `b`=ganho
 /// médio/perda média) medida numa janela de PnLs — usada tanto pro
 /// tamanho da perna por estratégia (`kelly_target_size`) quanto pro
 /// Kelly hierárquico por símbolo (`symbol_allocation_fraction`). `None`
@@ -1022,14 +1040,14 @@ fn kelly_fraction_from_pnls(recent_pnls: &VecDeque<f64>) -> Option<f64> {
         return None;
     }
     let total = recent_pnls.len() as f64;
-    let win_rate = wins.len() as f64 / total;
+    let win_rate_lcb = wilson_lower_bound(wins.len() as f64, total);
     let avg_win = wins.iter().sum::<f64>() / wins.len() as f64;
     let avg_loss = losses.iter().sum::<f64>() / losses.len() as f64;
     if avg_loss <= 0.0 {
         return None;
     }
     let payoff_ratio = avg_win / avg_loss;
-    let kelly_fraction = win_rate - (1.0 - win_rate) / payoff_ratio;
+    let kelly_fraction = win_rate_lcb - (1.0 - win_rate_lcb) / payoff_ratio;
     (kelly_fraction > 0.0).then_some(kelly_fraction)
 }
 
@@ -1057,6 +1075,22 @@ const MIN_SYMBOL_SAMPLES_FOR_FULL_TRUST: usize = 50;
 const SYMBOL_ALLOCATION_MIN: f64 = 0.10;
 const SYMBOL_ALLOCATION_MAX: f64 = 2.00;
 
+/// Razão bruta (ainda não normalizada nem limitada) entre o Kelly
+/// ponderado de UM símbolo e o Kelly da estratégia inteira — o número que
+/// `symbol_allocation_fraction` normaliza entre pares antes de clampar.
+/// `None` quando o símbolo não tem amostra suficiente pra medir Kelly
+/// próprio.
+fn raw_symbol_kelly_ratio(sym: &SymbolScaling, strategy_kelly: f64) -> Option<f64> {
+    let n = sym.recent_pnls.len();
+    if n == 0 {
+        return None;
+    }
+    let symbol_kelly = kelly_fraction_from_pnls(&sym.recent_pnls)?;
+    let weight = (n as f64 / MIN_SYMBOL_SAMPLES_FOR_FULL_TRUST as f64).min(1.0);
+    let blended_kelly = weight * symbol_kelly + (1.0 - weight) * strategy_kelly;
+    Some(blended_kelly / strategy_kelly)
+}
+
 /// Fração do orçamento de risco da ESTRATÉGIA que vai pra ESTE símbolo
 /// específico — a camada "símbolo" do Kelly hierárquico
 /// (portfólio→estratégia→símbolo). Pedido do usuário via auditoria
@@ -1068,28 +1102,68 @@ const SYMBOL_ALLOCATION_MAX: f64 = 2.00;
 /// da estratégia — símbolos melhores que a média recebem mais, piores
 /// recebem menos, nunca zero (mantém alguma amostra fluindo pra eles
 /// continuarem sendo avaliados).
+///
+/// Normalização entre símbolos (auditoria externa, 13/08/2026): antes,
+/// cada símbolo era clampado isoladamente em [0.10, 2.00] sem olhar pros
+/// outros — vários símbolos da MESMA estratégia podiam reivindicar 2.00x
+/// SIMULTANEAMENTE, estourando junto o orçamento real da estratégia (o
+/// clamp por símbolo nunca limitava a SOMA). Agora divide a razão bruta
+/// deste símbolo pela média das razões brutas de todos os símbolos ativos
+/// (com amostra própria) dessa estratégia antes de clampar — a soma das
+/// frações concorrentes converge pra ~N (a mesma verba total de antes),
+/// só redistribuída conforme o Kelly relativo de cada um, em vez de cada
+/// símbolo requisitar até 2x de forma independente.
 fn symbol_allocation_fraction(
-    symbol_scaling: Option<&SymbolScaling>,
-    strategy_scaling: Option<&StrategyScaling>,
+    portfolio: &PortfolioState,
+    strategy: Strategy,
+    symbol: &str,
 ) -> f64 {
-    let Some(sym) = symbol_scaling else { return 1.0 };
-    let n = sym.recent_pnls.len();
-    if n == 0 {
-        return 1.0;
-    }
-    let Some(symbol_kelly) = kelly_fraction_from_pnls(&sym.recent_pnls) else {
-        return 1.0;
-    };
-    let Some(strategy_kelly) = strategy_scaling.and_then(|s| kelly_fraction_from_pnls(&s.recent_pnls)) else {
+    let Some(strategy_kelly) = portfolio
+        .strategy_scaling
+        .get(&strategy)
+        .and_then(|s| kelly_fraction_from_pnls(&s.recent_pnls))
+    else {
         return 1.0;
     };
     if strategy_kelly <= 0.0 {
         return 1.0; // sem baseline confiável da estratégia — não penaliza nem infla
     }
-    let weight = (n as f64 / MIN_SYMBOL_SAMPLES_FOR_FULL_TRUST as f64).min(1.0);
-    let blended_kelly = weight * symbol_kelly + (1.0 - weight) * strategy_kelly;
-    (blended_kelly / strategy_kelly).clamp(SYMBOL_ALLOCATION_MIN, SYMBOL_ALLOCATION_MAX)
+
+    let Some(sym) = portfolio.symbol_scaling.get(&(strategy, symbol.to_string())) else {
+        return 1.0;
+    };
+    let Some(target_raw) = raw_symbol_kelly_ratio(sym, strategy_kelly) else {
+        return 1.0;
+    };
+
+    let peers: Vec<f64> = portfolio
+        .symbol_scaling
+        .iter()
+        .filter(|((s, _), _)| *s == strategy)
+        .filter_map(|(_, sc)| raw_symbol_kelly_ratio(sc, strategy_kelly))
+        .collect();
+    let peer_avg = if peers.is_empty() { 1.0 } else { peers.iter().sum::<f64>() / peers.len() as f64 };
+    let normalized = if peer_avg > 0.0 { target_raw / peer_avg } else { target_raw };
+
+    normalized.clamp(SYMBOL_ALLOCATION_MIN, SYMBOL_ALLOCATION_MAX)
 }
+
+// Gate de escalonamento orientado a evidência (auditoria externa,
+// 13/08/2026 — pedido explícito do usuário: "substituir o piso fixo de
+// 5min por um gate que exija amostra mínima de eventos independentes,
+// profit factor pós-custo, capacidade real de book, orçamento de risco
+// livre e ausência de concentração excessiva, em vez de simplesmente
+// alongar o cooldown fixo"). `MIN_TIME_BETWEEN_SCALE` continua existindo
+// como piso de segurança absoluto — foi uma correção de um bug real e
+// observado ao vivo (Kelly comprimindo em cima de si mesmo várias vezes
+// por minuto), não um chute; removê-lo reabriria esse bug. As duas
+// checagens abaixo são ADICIONAIS, não substituição: mesmo com tempo e
+// ciclos suficientes, só autoriza crescer se o orçamento de risco da
+// estratégia ainda tiver folga real pra USAR uma perna maior, e se o
+// lucro recente não estiver concentrado demais num único símbolo (o que
+// tornaria o Kelly medido uma aposta disfarçada de estratégia).
+const MAX_EXPOSURE_UTILIZATION_FOR_SCALE: f64 = 0.5;
+const MIN_DISTINCT_SYMBOLS_FOR_SCALE: usize = 2;
 
 /// Decide se a perna operacional de UMA estratégia pode crescer. Gate de
 /// segurança portfolio-wide primeiro (drawdown desde o pico do equity
@@ -1097,10 +1171,11 @@ fn symbol_allocation_fraction(
 /// só o histórico dessa estratégia: recuperação parcial do próprio
 /// drawdown local (task #98, substitui o antigo `at_new_peak` de equity
 /// inteiro), ciclos mínimos, profit factor e robustez-sem-melhor-trade na
-/// própria janela recente — e, se tudo passar, tamanha pelo Kelly
-/// fracionário medido (task #99), com fallback pro degrau fixo antigo só
-/// quando a amostra ainda não dá pra estimar Kelly (ex.: só vitórias até
-/// agora).
+/// própria janela recente, orçamento de risco livre e diversidade de
+/// símbolos (gate orientado a evidência, 13/08/2026) — e, se tudo passar,
+/// tamanha pelo Kelly fracionário medido (task #99), com fallback pro
+/// degrau fixo antigo só quando a amostra ainda não dá pra estimar Kelly
+/// (ex.: só vitórias até agora).
 fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strategy) -> Vec<ScaleEvent> {
     portfolio.peak_equity = portfolio.peak_equity.max(portfolio.equity);
     let drawdown = portfolio.drawdown_pct();
@@ -1119,6 +1194,27 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
     // drawdown elevado, então nenhuma proteção foi perdida.
 
     let equity = portfolio.equity;
+
+    // Calculado ANTES do borrow mutável de `scaling` abaixo — olha outros
+    // campos do portfolio (exposição, símbolos), não o de escalonamento.
+    let strategy_limit = cfg.strategy_limit_pct(strategy) * equity;
+    let current_exposure = *portfolio.exposure_by_strategy.get(&strategy).unwrap_or(&0.0);
+    // Orçamento de risco livre: não adianta aumentar a perna se a
+    // estratégia já está usando a maior parte do limite dela — o tamanho
+    // maior não teria onde caber na exposição livre agora mesmo.
+    let free_budget_ok = strategy_limit <= 0.0 || current_exposure <= strategy_limit * MAX_EXPOSURE_UTILIZATION_FOR_SCALE;
+    // Concentração: exige que o lucro recente venha de mais de um símbolo
+    // — Kelly medido em cima de um único símbolo é sorte daquele símbolo
+    // específico, não vantagem repetível da estratégia. `== 0` (nenhuma
+    // entrada de symbol_scaling ainda) não bloqueia — é o estado inicial
+    // normal antes da primeira resolução de trade.
+    let distinct_symbols = portfolio
+        .symbol_scaling
+        .iter()
+        .filter(|((s, _), sc)| *s == strategy && !sc.recent_pnls.is_empty())
+        .count();
+    let not_overconcentrated = distinct_symbols == 0 || distinct_symbols >= MIN_DISTINCT_SYMBOLS_FOR_SCALE;
+
     let Some(scaling) = portfolio.strategy_scaling.get_mut(&strategy) else {
         return Vec::new();
     };
@@ -1145,7 +1241,14 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
     let profit_factor_ok = profit_factor.map(|pf| pf >= cfg.scaling.min_recent_profit_factor_for_scale).unwrap_or(false);
     let robust_without_best = positive_excluding_best_trade(&scaling.recent_pnls, cfg.scaling.min_recent_samples_for_scale).unwrap_or(false);
 
-    if !(recovered && enough_cycles && low_drawdown && profit_factor_ok && robust_without_best) {
+    if !(recovered && enough_cycles && low_drawdown && profit_factor_ok && robust_without_best && free_budget_ok && not_overconcentrated) {
+        tracing::debug!(
+            strategy = strategy.key(),
+            recovered, enough_cycles, low_drawdown, profit_factor_ok, robust_without_best,
+            free_budget_ok, not_overconcentrated, distinct_symbols,
+            exposure_utilization = if strategy_limit > 0.0 { current_exposure / strategy_limit } else { 0.0 },
+            "escalonamento negado — condição de evidência não atendida"
+        );
         return Vec::new();
     }
 

@@ -339,12 +339,26 @@ async fn handle_message(
     // CONFIRMATION_WINDOW — isso acontece SEMPRE que o gate de fee é
     // cruzado, independente de já ter amostra suficiente pra confiar
     // (é assim que a amostra cresce).
-    pending_confirmations.push(PendingConfirmation {
-        symbol: symbol.to_string(),
-        entry_mid: mid,
-        entry_edge: instant_edge,
-        fired_at: Instant::now(),
-    });
+    //
+    // Deduplicação por cluster de evento (auditoria externa, 13/08/2026):
+    // EMIT_COOLDOWN (700ms) é muito menor que CONFIRMATION_WINDOW (30s) —
+    // sem isso, o MESMO movimento de mercado gerava dezenas de
+    // PendingConfirmation sobrepostas pro mesmo símbolo, todas amostrando
+    // essencialmente o mesmo evento e inflando artificialmente o tamanho
+    // da amostra (autocorrelação sendo contada como observações
+    // independentes em `empirical_edge`/Kelly). Enquanto já existe uma
+    // confirmação em voo pra este símbolo, novos sinais dele não abrem
+    // outra — só o preço final da janela já em andamento decide o
+    // desfecho dela.
+    let already_pending = pending_confirmations.iter().any(|p| p.symbol == symbol);
+    if !already_pending {
+        pending_confirmations.push(PendingConfirmation {
+            symbol: symbol.to_string(),
+            entry_mid: mid,
+            entry_edge: instant_edge,
+            fired_at: Instant::now(),
+        });
+    }
 
     let (net_edge, confidence, confirmation_note) = match empirical_edge(confirmation_history) {
         Some((edge, conf)) => {
