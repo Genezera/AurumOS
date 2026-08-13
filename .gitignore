@@ -21,3 +21,6 @@ whale_watch_rescan.log
 # Python
 __pycache__/
 *.pyc
+
+# PDFs gerados (regenerar com docs/generate_roadmap.py, não versionar o binário)
+*.pdf
