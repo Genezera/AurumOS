@@ -249,9 +249,19 @@ fn rotate(
     // (antigo WIDE_SYMBOLS como semente) em vez de zerar a cobertura —
     // evita perder de uma vez os símbolos que já sabíamos ter edge
     // (GRTUSDT, QTUMUSDT) só porque o processo reiniciou.
+    //
+    // Corrigido (12/08/2026, achado pelo usuário): a semente é a mesma
+    // lista (pensada pra perpétuos) usada nos DOIS universos — linear e
+    // spot. Sem checar contra `candidate_pool` (a lista REAL desta
+    // categoria, vinda da própria Bybit), o universo spot forçava dentro
+    // símbolos como MKRUSDT/FTMUSDT/EOSUSDT/ONEUSDT/ZECUSDT/DASHUSDT/
+    // STORJUSDT que nem existem como par spot — travados em 0 amostras
+    // pra sempre, mesmo depois da correção do Order Flow. Só inclui da
+    // semente o que realmente existe no pool de candidatos desta
+    // categoria.
     if first_round {
         for s in seed {
-            if !active.contains(s) {
+            if candidate_pool.contains(s) && !active.contains(s) {
                 active.push(s.clone());
             }
         }

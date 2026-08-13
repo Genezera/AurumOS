@@ -204,7 +204,20 @@ async fn main() -> anyhow::Result<()> {
     // dentro de UMA exchange (captura de spread como maker) em vez de entre
     // duas exchanges.
     let of_tx = tx.clone();
-    let mut order_flow = OrderFlowSource::new(symbols_rx.clone(), bus.clone(), edge_scores.clone());
+    // Corrigido (12/08/2026, achado pelo usuário: "porque os outros
+    // símbolos não estão mudando?"): Order Flow conecta no book SPOT da
+    // Bybit, mas até aqui recebia a lista de símbolos vinda do universo
+    // LINEAR (perpétuos) — confirmado via API da própria Bybit que
+    // MKRUSDT, FTMUSDT, EOSUSDT, ONEUSDT, ZECUSDT, DASHUSDT e STORJUSDT
+    // (todos presentes na semente original) simplesmente NÃO EXISTEM como
+    // par spot, então ficavam presos em 0 amostras pra sempre — não é
+    // "ainda não mediu", é "nunca vai medir". Passa a usar o mesmo
+    // universo spot real que a arbitragem já usa (symbols_rx_spot) —
+    // símbolos que existem em ambos os mercados continuam alimentando o
+    // ranking linear normalmente (a maioria dos pares populares existe
+    // nos dois), só os que são exclusivos de perpétuo deixam de ser
+    // tentados à toa.
+    let mut order_flow = OrderFlowSource::new(symbols_rx_spot.clone(), bus.clone(), edge_scores.clone());
     let order_flow_handle = tokio::spawn(async move {
         if let Err(e) = order_flow.run(of_tx).await {
             tracing::error!(error = %e, "fonte de order flow encerrou com erro");
