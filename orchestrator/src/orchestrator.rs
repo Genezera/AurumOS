@@ -182,14 +182,6 @@ pub async fn run(
     portfolio
 }
 
-/// Reduz o texto de um ativo ao símbolo/token que o identifica — arbitragem
-/// e order flow mandam "DOGEUSDT" puro, mas pump exhaustion anexa contexto
-/// como "DOGEUSDT (funding 0.15%, 24h +18%)"; cortamos no primeiro espaço
-/// ou parêntese pra comparar de forma justa entre módulos.
-fn base_symbol(asset: &str) -> &str {
-    asset.split([' ', '(']).next().unwrap_or(asset).trim()
-}
-
 /// Agrupa as oportunidades ainda válidas por símbolo-base e, quando duas ou
 /// mais estratégias diferentes concordam no mesmo ativo dentro da mesma
 /// janela, emite um evento de confluência pro dashboard — a parte central
@@ -203,7 +195,7 @@ fn detect_and_emit_confluence(
 ) -> HashMap<String, f64> {
     let mut by_symbol: HashMap<&str, Vec<Strategy>> = HashMap::new();
     for opp in pending {
-        let strategies = by_symbol.entry(base_symbol(&opp.asset)).or_default();
+        let strategies = by_symbol.entry(opp.base_symbol()).or_default();
         if !strategies.contains(&opp.strategy) {
             strategies.push(opp.strategy);
         }
@@ -257,8 +249,8 @@ fn pick_best(
         // operável algo que não teria vantagem sozinho.
         .filter(|(_, opp)| opp.score() > 0.0 && risk::evaluate(opp, portfolio, cfg).is_ok())
         .max_by(|(_, a), (_, b)| {
-            let bonus_a = confluence_bonus.get(base_symbol(&a.asset)).copied().unwrap_or(1.0);
-            let bonus_b = confluence_bonus.get(base_symbol(&b.asset)).copied().unwrap_or(1.0);
+            let bonus_a = confluence_bonus.get(a.base_symbol()).copied().unwrap_or(1.0);
+            let bonus_b = confluence_bonus.get(b.base_symbol()).copied().unwrap_or(1.0);
             (a.score() * bonus_a).partial_cmp(&(b.score() * bonus_b)).unwrap()
         })
         .map(|(idx, _)| idx)

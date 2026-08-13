@@ -118,6 +118,26 @@ pub struct PortfolioState {
     /// `cycles_since_scale` globais únicos. Sempre populado com todas as
     /// `Strategy::ALL` — `leg_size()` nunca deveria precisar de fallback.
     pub strategy_scaling: HashMap<Strategy, StrategyScaling>,
+    /// Kelly hierárquico (auditoria externa, 12/08/2026): PnL recente POR
+    /// SÍMBOLO dentro de cada estratégia — "Order Flow recebe X% de
+    /// orçamento; QTUM recebe 55% desse orçamento; GRT recebe 25%". Só o
+    /// suficiente pra calcular um Kelly por símbolo e comparar contra o da
+    /// estratégia inteira (ver `symbol_allocation_fraction`); não duplica
+    /// leg_size/pico/vale por símbolo — essa continua sendo uma decisão de
+    /// estratégia (Seção 9.1 do roadmap). Não persiste entre restarts de
+    /// propósito, mesmo raciocínio do `recent_pnls` de `StrategyScaling`
+    /// abaixo — refila rápido com o volume de trades por símbolo.
+    pub symbol_scaling: HashMap<(Strategy, String), SymbolScaling>,
+}
+
+/// PnL recente de UM símbolo dentro de UMA estratégia — a metade
+/// "símbolo" do Kelly hierárquico (portfólio→estratégia→SÍMBOLO). Sem
+/// leg_size/pico/vale próprios de propósito: o tamanho continua vindo da
+/// estratégia (`StrategyScaling::leg_size`), isto só ajusta QUANTO desse
+/// tamanho vai pra este símbolo específico.
+#[derive(Debug, Clone, Default)]
+pub struct SymbolScaling {
+    pub recent_pnls: VecDeque<f64>,
 }
 
 /// Estado de escalonamento de UMA estratégia — perna operacional, PnL
@@ -222,6 +242,7 @@ impl PortfolioState {
                 .iter()
                 .map(|&s| (s, StrategyScaling::new(cfg.initial_leg_size)))
                 .collect(),
+            symbol_scaling: HashMap::new(),
         }
     }
 
@@ -553,7 +574,19 @@ pub fn evaluate(
     // livre pra escalonar via Kelly/recuperacao parcial (Secao 9.1) mesmo
     // com o portfolio em drawdown; so o que ela pode USAR agora fica
     // temporariamente menor.
-    let leg_size = portfolio.leg_size(opp.strategy) * drawdown_ceiling_multiplier(portfolio.drawdown_pct());
+    //
+    // Kelly hierárquico (auditoria externa, 12/08/2026): dentro do
+    // orçamento que a estratégia já ganhou, o símbolo específico desta
+    // oportunidade recebe mais ou menos conforme seu próprio Kelly medido
+    // — ver symbol_allocation_fraction. Símbolo novo/pouco visto herda
+    // 100% do orçamento da estratégia (fração 1.0), nunca começa zerado.
+    let symbol_fraction = symbol_allocation_fraction(
+        portfolio.symbol_scaling.get(&(opp.strategy, opp.base_symbol().to_string())),
+        portfolio.strategy_scaling.get(&opp.strategy),
+    );
+    let leg_size = portfolio.leg_size(opp.strategy)
+        * drawdown_ceiling_multiplier(portfolio.drawdown_pct())
+        * symbol_fraction;
     let order_size = opp.capital_needed.min(leg_size);
 
     // Nunca aumentar o tamanho da ordem em uma estratégia logo após uma perda.
@@ -692,6 +725,21 @@ pub fn record_trade_result(
         scaling.recent_pnls.pop_front();
     }
 
+    // Kelly hierárquico (auditoria externa, 12/08/2026): mesmo bookkeeping,
+    // agora também por (estratégia, símbolo) — alimenta
+    // `symbol_allocation_fraction`. Janela mais curta que a da estratégia
+    // (100 vs. 200): amostra por símbolo é sempre menor, não faz sentido
+    // guardar uma janela do mesmo tamanho pra algo que refila mais devagar.
+    const SYMBOL_RECENT_PNLS_CAP: usize = 100;
+    let symbol_scaling = portfolio
+        .symbol_scaling
+        .entry((opp.strategy, opp.base_symbol().to_string()))
+        .or_default();
+    symbol_scaling.recent_pnls.push_back(pnl);
+    while symbol_scaling.recent_pnls.len() > SYMBOL_RECENT_PNLS_CAP {
+        symbol_scaling.recent_pnls.pop_front();
+    }
+
     maybe_scale(portfolio, cfg, opp.strategy)
 }
 
@@ -778,25 +826,20 @@ fn drawdown_ceiling_multiplier(drawdown: f64) -> f64 {
     }
 }
 
-/// Sizing contínuo estilo Kelly fracionário (task #99): em vez do degrau
-/// fixo antigo (`leg_size * scale_growth_factor`), o tamanho-alvo da perna é
-/// recalculado a cada aumento a partir da fração de Kelly medida na janela
-/// recente de trades DESSA estratégia — `p` = taxa de acerto, `b` = ganho
-/// médio / perda média, `kelly = p - (1-p)/b`. Aplica só uma fração de
-/// segurança do Kelly cheio (`kelly_safety_fraction`) porque o Kelly cheio
-/// maximiza crescimento assumindo p/b exatos e conhecidos — nunca o caso
-/// com amostra finita e ruidosa; Kelly fracionário é a forma padrão de
-/// manter a maior parte do crescimento perdendo bem menos robustez.
-/// `None` quando não há amostra dos dois lados (só vitórias ou só perdas
-/// na janela) ou quando o Kelly medido é <= 0 — a própria matemática
-/// dizendo "não aposte mais aqui ainda", não um caso de fallback silencioso.
-fn kelly_target_size(scaling: &StrategyScaling, cfg: &RiskConfig, equity: f64) -> Option<f64> {
-    let wins: Vec<f64> = scaling.recent_pnls.iter().copied().filter(|&p| p > 0.0).collect();
-    let losses: Vec<f64> = scaling.recent_pnls.iter().copied().filter(|&p| p < 0.0).map(f64::abs).collect();
+/// Fração de Kelly cheio (`p - (1-p)/b`, `p`=taxa de acerto, `b`=ganho
+/// médio/perda média) medida numa janela de PnLs — usada tanto pro
+/// tamanho da perna por estratégia (`kelly_target_size`) quanto pro
+/// Kelly hierárquico por símbolo (`symbol_allocation_fraction`). `None`
+/// quando não há amostra dos dois lados (só vitórias ou só perdas na
+/// janela) ou quando o Kelly medido é <= 0 — a própria matemática dizendo
+/// "sem vantagem aqui ainda", não um caso de fallback silencioso.
+fn kelly_fraction_from_pnls(recent_pnls: &VecDeque<f64>) -> Option<f64> {
+    let wins: Vec<f64> = recent_pnls.iter().copied().filter(|&p| p > 0.0).collect();
+    let losses: Vec<f64> = recent_pnls.iter().copied().filter(|&p| p < 0.0).map(f64::abs).collect();
     if wins.is_empty() || losses.is_empty() {
         return None;
     }
-    let total = scaling.recent_pnls.len() as f64;
+    let total = recent_pnls.len() as f64;
     let win_rate = wins.len() as f64 / total;
     let avg_win = wins.iter().sum::<f64>() / wins.len() as f64;
     let avg_loss = losses.iter().sum::<f64>() / losses.len() as f64;
@@ -805,10 +848,65 @@ fn kelly_target_size(scaling: &StrategyScaling, cfg: &RiskConfig, equity: f64) -
     }
     let payoff_ratio = avg_win / avg_loss;
     let kelly_fraction = win_rate - (1.0 - win_rate) / payoff_ratio;
-    if kelly_fraction <= 0.0 {
-        return None;
-    }
+    (kelly_fraction > 0.0).then_some(kelly_fraction)
+}
+
+/// Sizing contínuo estilo Kelly fracionário (task #99): em vez do degrau
+/// fixo antigo (`leg_size * scale_growth_factor`), o tamanho-alvo da perna é
+/// recalculado a cada aumento a partir da fração de Kelly medida na janela
+/// recente de trades DESSA estratégia. Aplica só uma fração de segurança do
+/// Kelly cheio (`kelly_safety_fraction`) porque o Kelly cheio maximiza
+/// crescimento assumindo p/b exatos e conhecidos — nunca o caso com amostra
+/// finita e ruidosa; Kelly fracionário é a forma padrão de manter a maior
+/// parte do crescimento perdendo bem menos robustez.
+fn kelly_target_size(scaling: &StrategyScaling, cfg: &RiskConfig, equity: f64) -> Option<f64> {
+    let kelly_fraction = kelly_fraction_from_pnls(&scaling.recent_pnls)?;
     Some(equity * kelly_fraction * cfg.scaling.kelly_safety_fraction)
+}
+
+// Kelly hierárquico (auditoria externa, 12/08/2026): quantas amostras
+// PRÓPRIAS de um símbolo até confiar 100% no Kelly dele em vez do prior da
+// estratégia inteira — pesa linearmente entre os dois até lá.
+const MIN_SYMBOL_SAMPLES_FOR_FULL_TRUST: usize = 50;
+// Nunca zera nem infla um símbolo além disso, mesmo com Kelly bem
+// destoante da estratégia — amostra por símbolo é sempre menor e mais
+// ruidosa que a da estratégia inteira, então o intervalo é mais apertado
+// que os 0-100% que o próprio Kelly fracionário já aplica em cima.
+const SYMBOL_ALLOCATION_MIN: f64 = 0.10;
+const SYMBOL_ALLOCATION_MAX: f64 = 2.00;
+
+/// Fração do orçamento de risco da ESTRATÉGIA que vai pra ESTE símbolo
+/// específico — a camada "símbolo" do Kelly hierárquico
+/// (portfólio→estratégia→símbolo). Pedido do usuário via auditoria
+/// externa: "Order Flow recebe X% de orçamento de risco; QTUM recebe 55%
+/// desse orçamento; GRT recebe 25%". Símbolo nunca visto ou com pouca
+/// amostra herda o prior da estratégia (fração 1.0 = "trata igual à
+/// média da estratégia até provar diferente"); conforme acumula PnL
+/// próprio, a fração passa a refletir o Kelly DESSE símbolo relativo ao
+/// da estratégia — símbolos melhores que a média recebem mais, piores
+/// recebem menos, nunca zero (mantém alguma amostra fluindo pra eles
+/// continuarem sendo avaliados).
+fn symbol_allocation_fraction(
+    symbol_scaling: Option<&SymbolScaling>,
+    strategy_scaling: Option<&StrategyScaling>,
+) -> f64 {
+    let Some(sym) = symbol_scaling else { return 1.0 };
+    let n = sym.recent_pnls.len();
+    if n == 0 {
+        return 1.0;
+    }
+    let Some(symbol_kelly) = kelly_fraction_from_pnls(&sym.recent_pnls) else {
+        return 1.0;
+    };
+    let Some(strategy_kelly) = strategy_scaling.and_then(|s| kelly_fraction_from_pnls(&s.recent_pnls)) else {
+        return 1.0;
+    };
+    if strategy_kelly <= 0.0 {
+        return 1.0; // sem baseline confiável da estratégia — não penaliza nem infla
+    }
+    let weight = (n as f64 / MIN_SYMBOL_SAMPLES_FOR_FULL_TRUST as f64).min(1.0);
+    let blended_kelly = weight * symbol_kelly + (1.0 - weight) * strategy_kelly;
+    (blended_kelly / strategy_kelly).clamp(SYMBOL_ALLOCATION_MIN, SYMBOL_ALLOCATION_MAX)
 }
 
 /// Decide se a perna operacional de UMA estratégia pode crescer. Gate de

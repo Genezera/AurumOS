@@ -129,4 +129,14 @@ impl Opportunity {
         let holding_hours = (self.expected_holding_secs / 3600.0).max(0.0001);
         (self.net_edge * self.confidence) / tail_risk / self.capital_needed.max(1.0) / holding_hours
     }
+
+    /// Reduz `asset` ao símbolo/token que o identifica — arbitragem e order
+    /// flow mandam "DOGEUSDT" puro, mas pump exhaustion anexa contexto como
+    /// "DOGEUSDT (funding 0,15%, 24h +18%)"; corta no primeiro espaço ou
+    /// parêntese pra comparar de forma justa entre módulos. Usado tanto pra
+    /// confluência (orchestrator.rs) quanto pro Kelly hierárquico por
+    /// símbolo (risk.rs).
+    pub fn base_symbol(&self) -> &str {
+        self.asset.split([' ', '(']).next().unwrap_or(&self.asset).trim()
+    }
 }
