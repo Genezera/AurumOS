@@ -146,7 +146,23 @@ async fn main() -> anyhow::Result<()> {
     let symbol_universe_handle = {
         let scores = edge_scores.clone();
         let su_bus = bus.clone();
-        tokio::spawn(async move { symbol_universe::run(scores, symbols_tx, seed_symbols, su_bus).await })
+        let seed = seed_symbols.clone();
+        tokio::spawn(async move { symbol_universe::run(symbol_universe::LINEAR, scores, symbols_tx, seed, su_bus).await })
+    };
+
+    // Universo dinâmico SEPARADO pra arbitragem (12/08/2026, pedido do
+    // usuário: "estende essa mesma busca ampla pra arbitragem também") —
+    // arbitragem compara SPOT-vs-SPOT (Bybit x Bitget), não perpétuos; usar
+    // a lista `category=linear` acima faria "exploração" em símbolos
+    // sintéticos (ações/commodities tokenizados) sem par spot em nenhuma das
+    // duas exchanges. Mesma arquitetura (EdgeStats medido de verdade,
+    // proven+exploração, rotação), fonte e mercado diferentes.
+    let (symbols_tx_spot, symbols_rx_spot) = tokio::sync::watch::channel(seed_symbols.clone());
+    let edge_scores_spot = symbol_universe::new_edge_scores();
+    let symbol_universe_spot_handle = {
+        let scores = edge_scores_spot.clone();
+        let su_bus = bus.clone();
+        tokio::spawn(async move { symbol_universe::run(symbol_universe::SPOT, scores, symbols_tx_spot, seed_symbols, su_bus).await })
     };
 
     // Quadros de fusão (pedido do usuário: "faça a fusão", "faça
@@ -158,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
     // Arbitragem (Fase 1): book público da Bybit e da Bitget via WebSocket,
     // sem precisar de chave de API.
     let arb_tx = tx.clone();
-    let mut arbitrage = ArbitrageSource::new(symbols_rx.clone(), bus.clone());
+    let mut arbitrage = ArbitrageSource::new(symbols_rx_spot.clone(), bus.clone(), edge_scores_spot.clone());
     let arbitrage_handle = tokio::spawn(async move {
         if let Err(e) = arbitrage.run(arb_tx).await {
             tracing::error!(error = %e, "fonte de arbitragem encerrou com erro");
@@ -275,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
         orchestrator::run(rx, cfg, max_cycles, Duration::from_millis(150), bus, state_path, kill_file_path, reset_drawdown_file_path).await;
 
     symbol_universe_handle.abort();
+    symbol_universe_spot_handle.abort();
     arbitrage_handle.abort();
     order_flow_handle.abort();
     whale_watch_handle.abort();

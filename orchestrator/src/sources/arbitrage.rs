@@ -10,6 +10,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::events::{DashboardEvent, EventBus};
 use crate::sources::{best_level, SignalSource};
+use crate::symbol_universe::{record_edge, EdgeScores};
 use crate::types::{Direction, Market, Opportunity, Strategy};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(8);
@@ -69,13 +70,20 @@ type BookMap = Arc<RwLock<HashMap<String, TopOfBook>>>;
 /// descontando taxas estimadas) supera `MIN_NET_EDGE`. Dado 100% real via
 /// WebSocket público — não precisa de chave de API para isso.
 pub struct ArbitrageSource {
+    /// Universo dinâmico PRÓPRIO da arbitragem (spot Bybit x spot Bitget —
+    /// pedido do usuário 12/08/2026: "estende essa mesma busca ampla pra
+    /// arbitragem também"). Não é o mesmo canal que Order Flow/Pump
+    /// Exhaustion usam — aquele vem de `category=linear` (perpétuos), que
+    /// inclui símbolos sintéticos (ações/commodities tokenizados) sem par
+    /// spot em nenhuma das duas exchanges.
     pub symbols_rx: watch::Receiver<Vec<String>>,
     pub bus: EventBus,
+    pub edge_scores: EdgeScores,
 }
 
 impl ArbitrageSource {
-    pub fn new(symbols_rx: watch::Receiver<Vec<String>>, bus: EventBus) -> Self {
-        Self { symbols_rx, bus }
+    pub fn new(symbols_rx: watch::Receiver<Vec<String>>, bus: EventBus, edge_scores: EdgeScores) -> Self {
+        Self { symbols_rx, bus, edge_scores }
     }
 }
 
@@ -101,8 +109,9 @@ impl SignalSource for ArbitrageSource {
 
             let tx2 = tx.clone();
             let bus2 = self.bus.clone();
+            let edge_scores2 = self.edge_scores.clone();
             let comparator_handle = tokio::spawn(async move {
-                run_comparator(symbols, bybit_books, bitget_books, tx2, bus2).await
+                run_comparator(symbols, bybit_books, bitget_books, tx2, bus2, edge_scores2).await
             });
 
             // As 3 tarefas rodam pra sempre sozinhas (cada uma já reconecta
@@ -298,7 +307,7 @@ async fn handle_bitget_message(text: &str, books: &BookMap) {
 
 // ---------------- comparador ----------------
 
-async fn run_comparator(symbols: Vec<String>, bybit: BookMap, bitget: BookMap, tx: Sender<Opportunity>, bus: EventBus) {
+async fn run_comparator(symbols: Vec<String>, bybit: BookMap, bitget: BookMap, tx: Sender<Opportunity>, bus: EventBus, edge_scores: EdgeScores) {
     let mut last_emitted: HashMap<(String, &'static str), Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(150));
     let mut last_diag = Instant::now() - Duration::from_secs(60);
@@ -339,6 +348,13 @@ async fn run_comparator(symbols: Vec<String>, bybit: BookMap, bitget: BookMap, t
             let edge_1 = (bb.bid - bg.ask) / bg.ask - ROUND_TRIP_FEE;
             // Direção 2: comprar na Bybit (ask), vender na Bitget (bid).
             let edge_2 = (bg.bid - bb.ask) / bb.ask - ROUND_TRIP_FEE;
+
+            // Alimenta o universo dinâmico PRÓPRIO da arbitragem (spot x
+            // spot) com o edge medido de verdade a cada tick com book válido
+            // nas duas exchanges — igual ao que Order Flow já faz pro
+            // universo linear. Registra a melhor das duas direções: é o que
+            // decide se vale a pena manter este par ativo.
+            record_edge(&edge_scores, symbol, edge_1.max(edge_2));
 
             if diag_now {
                 tracing::debug!(

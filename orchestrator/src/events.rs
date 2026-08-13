@@ -148,6 +148,11 @@ pub enum DashboardEvent {
     /// agora e por quê, em vez de uma lista fixa invisível.
     #[serde(rename = "symbol_universe")]
     SymbolUniverse {
+        /// "linear" (perpétuos — Order Flow/Pump Exhaustion/Liquidation
+        /// Hunter) ou "spot" (Bybit spot x Bitget spot — Arbitragem). Cada
+        /// mercado tem seu próprio universo dinâmico independente (12/08/2026)
+        /// porque o edge medido e os pares disponíveis são diferentes entre eles.
+        kind: String,
         total: usize,
         top: Vec<SymbolRanking>,
     },
@@ -284,8 +289,8 @@ impl DashboardEvent {
         DashboardEvent::MacroCalendar { events }
     }
 
-    pub fn symbol_universe(total: usize, top: Vec<SymbolRanking>) -> Self {
-        DashboardEvent::SymbolUniverse { total, top }
+    pub fn symbol_universe(kind: &str, total: usize, top: Vec<SymbolRanking>) -> Self {
+        DashboardEvent::SymbolUniverse { kind: kind.to_string(), total, top }
     }
 
     pub fn risk_config(cfg: &RiskConfig) -> Self {
