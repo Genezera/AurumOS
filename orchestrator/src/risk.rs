@@ -589,12 +589,32 @@ pub fn evaluate(
         * symbol_fraction;
     let order_size = opp.capital_needed.min(leg_size);
 
-    // Nunca aumentar o tamanho da ordem em uma estratégia logo após uma perda.
+    // Nunca aumentar o tamanho da ordem em uma estratégia logo após uma
+    // perda — mas comparado contra a perna BASE da estratégia
+    // (`portfolio.leg_size`), não contra o tamanho exato do último trade
+    // individual.
+    //
+    // Bug real encontrado ao vivo (13/08/2026, achado pelo usuário: "parou
+    // de ter trades desde 23 horas"): comparar contra o último order_size
+    // realizado travava a estratégia PARA SEMPRE. `order_size` varia por
+    // símbolo (Kelly hierárquico, task #101 — `symbol_fraction` vai de
+    // 0.10 a 2.00), então era pura sorte se o próximo candidato calhava de
+    // ter fração menor que o símbolo do trade perdido. Order Flow, com
+    // ~200+ símbolos ativos, quase sempre tirava um símbolo com fração
+    // maior logo em seguida — bloqueado. E como só um trade BEM-SUCEDIDO
+    // atualiza `last_outcome_by_strategy`/`last_order_size_by_strategy`,
+    // e nenhum trade conseguia passar, virava um deadlock permanente sem
+    // nenhum erro, sem nenhum log (a rejeição em si só era logada — e só
+    // em debug! — se o candidato já tivesse passado por AQUI; nada
+    // indicava no nível info que zero trades estavam acontecendo).
+    // Comparar contra a perna base (estável, só muda por escalonamento já
+    // gated por profit factor) preserva a intenção original — não deixar
+    // a estratégia se auto-escalar pra cima logo após perder — sem travar
+    // em ruído de variação por símbolo.
     if portfolio.last_outcome_by_strategy.get(&opp.strategy) == Some(&TradeOutcome::Loss) {
-        if let Some(&last_size) = portfolio.last_order_size_by_strategy.get(&opp.strategy) {
-            if order_size > last_size {
-                return Err(RejectReason::MartingaleBlocked);
-            }
+        let base_leg_size = portfolio.leg_size(opp.strategy);
+        if order_size > base_leg_size {
+            return Err(RejectReason::MartingaleBlocked);
         }
     }
 

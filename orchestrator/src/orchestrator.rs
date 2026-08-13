@@ -247,7 +247,24 @@ fn pick_best(
         // risk gate — precisa também ter vantagem esperada positiva. O
         // bônus de confluência entra DEPOIS desse filtro, então nunca torna
         // operável algo que não teria vantagem sozinho.
-        .filter(|(_, opp)| opp.score() > 0.0 && risk::evaluate(opp, portfolio, cfg).is_ok())
+        //
+        // Log em debug! (silencioso em produção, RUST_LOG=orchestrator=info
+        // por padrão) — sem isso, um candidato que nunca passa nesse filtro
+        // não deixa rastro nenhum: `execute()` só loga rejeição pra quem já
+        // passou aqui, então "tudo rejeitado silenciosamente" era invisível
+        // (achado 13/08/2026 investigando trades parados por 5h+ sem erro).
+        .filter(|(_, opp)| {
+            if opp.score() <= 0.0 {
+                return false;
+            }
+            match risk::evaluate(opp, portfolio, cfg) {
+                Ok(_) => true,
+                Err(reason) => {
+                    tracing::debug!(?reason, strategy = opp.strategy.key(), asset = %opp.asset, "candidato excluído no pick_best");
+                    false
+                }
+            }
+        })
         .max_by(|(_, a), (_, b)| {
             let bonus_a = confluence_bonus.get(a.base_symbol()).copied().unwrap_or(1.0);
             let bonus_b = confluence_bonus.get(b.base_symbol()).copied().unwrap_or(1.0);
