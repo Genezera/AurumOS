@@ -68,6 +68,15 @@ multi_asset = 0.0015
 launch_max = 1.0
 # Alavancagem máxima em instrumentos líquidos (arbitragem, macro, order flow).
 liquid_max = 2.0
+# Teto global de alavancagem do PORTFÓLIO INTEIRO (task #89, auditoria
+# externa 13/08/2026) — soma do notional alavancado de TODAS as posições
+# abertas ao mesmo tempo, dividido pelo equity. Diferente de launch_max/
+# liquid_max acima, que só olham uma oportunidade isolada: várias posições
+# 2x em estratégias diferentes passariam nelas individualmente mas juntas
+# poderiam expor o portfólio bem além de 1x. Default conservador (1.0 =
+# sem alavancagem agregada); nunca pode passar de 2.0 mesmo que este valor
+# seja aumentado (ver ABSOLUTE_LEVERAGE_CEILING em risk.rs).
+global_max = 1.0
 
 [scaling]
 # Ciclos mínimos desde o último aumento de perna antes de permitir outro.
@@ -78,15 +87,30 @@ max_drawdown_pct_for_scale = 0.02
 drawdown_halve_threshold_pct = 0.02
 # Fator de crescimento aplicado à perna quando as condições de escalonamento são atendidas.
 scale_growth_factor = 1.15
+# Fator de REDUÇÃO aplicado à perna quando o profit factor recente cai
+# abaixo de min_recent_profit_factor_to_hold (task #87, auditoria externa
+# 13/08/2026: "hierarquia PF 1,3 aprovação vs 1,2 continuar + redução
+# ativa se piorar"). Mais agressivo que o inverso do crescimento (1/1.15 =
+# 0.87) de propósito — reagir a uma piora deve ser mais rápido que crescer
+# numa melhora, princípio comum de gestão de risco.
+scale_shrink_factor = 0.80
 # Fração máxima do equity total que uma única perna pode representar.
 max_leg_fraction_of_equity = 0.30
-# Profit factor mínimo (janela móvel dos últimos trades) exigido — além de
-# ciclos+drawdown baixo — pra autorizar escalonamento. Elevado de 1.1 para
-# 1.2 (2ª revisão técnica externa, 13/08/2026): 1.1 é frágil demais contra
-# ruído/custos — some fácil com uma única operação ruim. Combinado agora
-# com a checagem de "resultado ainda positivo removendo o melhor trade"
-# (risk.rs::positive_excluding_best_trade), não só o profit factor bruto.
-min_recent_profit_factor_for_scale = 1.2
+# Hierarquia de 2 níveis de profit factor (janela móvel dos últimos
+# trades), task #87 (auditoria externa, 13/08/2026) — substitui o limiar
+# único anterior (1.2, ele mesmo já elevado de 1.1 numa revisão técnica
+# anterior por ser frágil demais contra ruído/custos). Acima do nível de
+# APROVAÇÃO autoriza crescer a perna; abaixo do nível de CONTINUAR (ver
+# min_recent_profit_factor_to_hold) força uma redução ativa; entre os
+# dois, mantém o tamanho atual — zona de tolerância a ruído, evita
+# oscilar a cada trade. Combinado com a checagem de "resultado ainda
+# positivo removendo o melhor trade" (risk.rs::positive_excluding_best_trade)
+# pra crescer, não só o profit factor bruto.
+min_recent_profit_factor_for_scale = 1.3
+# Nível de "continuar" da hierarquia acima — abaixo disto, a estratégia
+# não está só "não boa o suficiente pra crescer", está degradando o
+# suficiente pra reduzir ativamente.
+min_recent_profit_factor_to_hold = 1.2
 # Amostra mínima na janela móvel antes do profit factor contar pra algo —
 # menor que min_cycles_between_scale de propósito, pra não virar um segundo
 # gargalo redundante.

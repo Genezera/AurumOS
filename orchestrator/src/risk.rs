@@ -19,6 +19,16 @@ use crate::types::{Opportunity, Strategy};
 pub struct LeverageConfig {
     pub launch_max: f64,
     pub liquid_max: f64,
+    /// Teto global de alavancagem do PORTFÓLIO INTEIRO (auditoria externa,
+    /// 13/08/2026, task #89) — diferente de `launch_max`/`liquid_max`, que
+    /// só limitam a alavancagem de UMA oportunidade isolada. Aqui é a soma
+    /// do notional alavancado de TODAS as posições abertas ao mesmo tempo,
+    /// dividido pelo equity — protege contra várias posições alavancadas
+    /// simultâneas que, isoladamente, passariam nos limites por estratégia
+    /// mas juntas expõem o portfólio muito além de 1x. Sempre clampado por
+    /// `ABSOLUTE_LEVERAGE_CEILING` (2.0) — mesmo um risk.toml mal
+    /// configurado nunca consegue autorizar mais que isso.
+    pub global_max: f64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -31,8 +41,19 @@ pub struct ScalingConfig {
     /// Profit factor mínimo (janela móvel recente) exigido pra permitir
     /// aumentar a perna — revisão técnica externa, 13/08/2026: ciclos +
     /// drawdown baixo sozinhos não provam que a estratégia está lucrando de
-    /// verdade nesse trecho recente.
+    /// verdade nesse trecho recente. Limiar de APROVAÇÃO da hierarquia de
+    /// 2 níveis (task #87) — o de baixo é `min_recent_profit_factor_to_hold`.
     pub min_recent_profit_factor_for_scale: f64,
+    /// Limiar de "continuar" da hierarquia de 2 níveis (task #87, auditoria
+    /// externa 13/08/2026) — abaixo disto, o profit factor recente não é
+    /// só "não bom o suficiente pra crescer" (zona entre este valor e
+    /// `min_recent_profit_factor_for_scale`, onde a perna só se mantém),
+    /// é "ruim o suficiente pra encolher ativamente" (ver `scale_shrink_factor`).
+    pub min_recent_profit_factor_to_hold: f64,
+    /// Fator de redução aplicado à perna quando o profit factor recente
+    /// cai abaixo de `min_recent_profit_factor_to_hold` (task #87) — mesmo
+    /// racional de `scale_growth_factor`, mas na direção oposta.
+    pub scale_shrink_factor: f64,
     pub min_recent_samples_for_scale: usize,
     /// Recuperação parcial (revisão pós-fusão, 12/08/2026): fração do maior
     /// drawdown LOCAL (pico→vale de PnL acumulado) que uma estratégia
@@ -151,6 +172,14 @@ pub struct PortfolioState {
     /// real de submissão de ordem que uma conta de varejo tem. Não
     /// persiste (estado operacional transitório, não capital).
     pub venue_rate_limiters: HashMap<String, RateLimiterState>,
+    /// Notional alavancado agregado de TODAS as posições abertas agora
+    /// (soma de `order_size * leverage` de cada uma) — a métrica que o
+    /// teto global de alavancagem (`LeverageConfig::global_max`, task #89)
+    /// compara contra o equity. Mesmo ciclo de vida de
+    /// `exposure_by_strategy`: `+=` em `open_exposure`, `-=` em
+    /// `record_trade_result`. Não persiste (estado operacional
+    /// transitório, não capital).
+    pub total_leveraged_notional: f64,
 }
 
 /// Filtro real de um símbolo numa exchange — quantidade mínima, passo de
@@ -295,6 +324,7 @@ impl PortfolioState {
             symbol_scaling: HashMap::new(),
             symbol_filters: HashMap::new(),
             venue_rate_limiters: HashMap::new(),
+            total_leveraged_notional: 0.0,
         }
     }
 
@@ -611,7 +641,37 @@ pub enum RejectReason {
     /// Bybit, `minTradeUSDT` na Bitget). Uma exchange de verdade rejeitaria
     /// essa ordem; antes disso nada verificava.
     BelowExchangeMinimum,
+    /// Trava estrutural do Launch Radar (task #88) — ver
+    /// `LAUNCH_TRADE_ENABLED`.
+    LaunchTradingDisabled,
+    /// Teto global de alavancagem do portfólio inteiro (task #89) —
+    /// diferente de `NoLeverageOnLaunch`/`LeverageTooHigh`, que só olham a
+    /// alavancagem de UMA oportunidade isolada. Este soma o notional
+    /// alavancado de TODAS as posições já abertas.
+    GlobalLeverageExceeded,
 }
+
+/// Teto absoluto de alavancagem do portfólio — nunca pode ser excedido,
+/// mesmo que `risk.toml` configure `leverage.global_max` acima disso.
+/// Defesa em profundidade (auditoria externa, 13/08/2026, task #89): o
+/// arquivo de config é editável por qualquer um, então o valor "real"
+/// máximo que o sistema aceita não pode depender só dele.
+const ABSOLUTE_LEVERAGE_CEILING: f64 = 2.0;
+
+/// Trava estrutural do Launch Radar (task #88, auditoria externa
+/// 13/08/2026: "defesa em profundidade"). Hoje o Launch Radar (CEX+DEX)
+/// nunca executa porque `net_edge` fica hardcoded em 0.0 nos dois módulos
+/// (`launch_radar.rs`/`dex_launch_radar.rs`), o que zera `opp.score()` e é
+/// filtrado antes mesmo de chegar aqui (ver `pick_best` em
+/// orchestrator.rs) — mas esse é o ÚNICO motivo, e é fácil de mudar sem
+/// querer (bastaria alguém implementar uma camada de edge real pro Launch
+/// Radar, como já foi feito pra Order Flow/Arbitragem/Pump Exhaustion,
+/// pra reabilitar execução sem nenhuma decisão consciente sobre isso).
+/// Lançamento de token é o contexto de MENOR liquidez/confiabilidade de
+/// livro do sistema inteiro — merece um segundo trava independente, não
+/// só depender do score ficar zerado. Mude pra `true` só com decisão
+/// explícita, não como efeito colateral de outra mudança.
+const LAUNCH_TRADE_ENABLED: bool = false;
 
 /// Quais exchanges (venues) uma estratégia realmente usa pra executar —
 /// usado tanto pro rate limiter quanto, no futuro, pra checar filtros por
@@ -677,6 +737,7 @@ pub fn consume_rate_limit(portfolio: &mut PortfolioState, strategy: Strategy) {
 pub fn open_exposure(portfolio: &mut PortfolioState, opp: &Opportunity, approved: &Approved) {
     *portfolio.exposure_by_strategy.entry(opp.strategy).or_insert(0.0) += approved.capital_at_risk;
     *portfolio.exposure_by_group.entry(opp.correlation_group.clone()).or_insert(0.0) += approved.capital_at_risk;
+    portfolio.total_leveraged_notional += approved.order_size * opp.leverage;
 }
 
 /// Avalia uma oportunidade contra o estado atual do portfólio e os limites
@@ -689,6 +750,10 @@ pub fn evaluate(
 ) -> Result<Approved, RejectReason> {
     if opp.is_expired() {
         return Err(RejectReason::Expired);
+    }
+
+    if opp.strategy == Strategy::Launch && !LAUNCH_TRADE_ENABLED {
+        return Err(RejectReason::LaunchTradingDisabled);
     }
 
     if opp.strategy == Strategy::Launch && opp.leverage > cfg.leverage.launch_max {
@@ -796,6 +861,21 @@ pub fn evaluate(
         }
     }
 
+    // Teto global de alavancagem (auditoria externa, 13/08/2026, task
+    // #89) — os dois checks de alavancagem lá em cima só olham ESTA
+    // oportunidade isolada; várias posições 2x simultâneas em estratégias
+    // DIFERENTES passariam nelas individualmente mas juntas exporiam o
+    // portfólio muito além de 1x-2x. `global_max` do risk.toml nunca
+    // consegue passar de `ABSOLUTE_LEVERAGE_CEILING` — defesa em
+    // profundidade contra config mal ajustada.
+    if portfolio.equity > 0.0 {
+        let effective_cap = cfg.leverage.global_max.min(ABSOLUTE_LEVERAGE_CEILING);
+        let projected_notional = portfolio.total_leveraged_notional + order_size * opp.leverage;
+        if projected_notional / portfolio.equity > effective_cap {
+            return Err(RejectReason::GlobalLeverageExceeded);
+        }
+    }
+
     Ok(Approved {
         order_size,
         capital_at_risk,
@@ -869,6 +949,7 @@ pub fn record_trade_result(
     if let Some(e) = portfolio.exposure_by_group.get_mut(&opp.correlation_group) {
         *e = (*e - approved.capital_at_risk).max(0.0);
     }
+    portfolio.total_leveraged_notional = (portfolio.total_leveraged_notional - approved.order_size * opp.leverage).max(0.0);
 
     portfolio
         .last_outcome_by_strategy
@@ -1237,25 +1318,55 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
         recovered_fraction >= cfg.scaling.partial_recovery_fraction
     };
 
+    // Hierarquia de profit factor (task #87, auditoria externa,
+    // 13/08/2026): antes só existia um limiar único — abaixo dele, nada
+    // mudava (nem cresce nem encolhe); acima, cresce. Isso deixava uma
+    // estratégia degradando lentamente (PF caindo de 1.3 pra 1.15, por
+    // exemplo) com a MESMA perna de quando estava indo bem — nenhuma
+    // resposta ativa à piora. Agora são dois limiares: >= approve (1.3)
+    // autoriza CRESCER; abaixo de hold (1.2) força uma REDUÇÃO ativa;
+    // entre os dois, mantém o tamanho atual (zona de tolerância a ruído,
+    // evita ficar oscilando pra cima e pra baixo a cada trade). O piso de
+    // `enough_cycles` (tempo+ciclos desde o último ajuste) se aplica aos
+    // DOIS sentidos — é a mesma proteção que evita o Kelly comprimindo
+    // sobre si mesmo (ver comentário de MIN_TIME_BETWEEN_SCALE), e sem
+    // ela uma redução ativa correria o mesmo risco de colapso repetido
+    // que já aconteceu com o antigo `halve_all_legs` por trade.
     let profit_factor = recent_profit_factor(&scaling.recent_pnls, cfg.scaling.min_recent_samples_for_scale);
-    let profit_factor_ok = profit_factor.map(|pf| pf >= cfg.scaling.min_recent_profit_factor_for_scale).unwrap_or(false);
     let robust_without_best = positive_excluding_best_trade(&scaling.recent_pnls, cfg.scaling.min_recent_samples_for_scale).unwrap_or(false);
 
-    if !(recovered && enough_cycles && low_drawdown && profit_factor_ok && robust_without_best && free_budget_ok && not_overconcentrated) {
+    // Gates de CRESCIMENTO — recuperação parcial, drawdown baixo,
+    // orçamento livre e diversidade nunca fazem sentido bloquear uma
+    // REDUÇÃO (o oposto, na verdade: drawdown alto é motivo pra encolher,
+    // não pra travar o encolhimento), então só entram na decisão de
+    // crescer.
+    let growth_gates_ok = recovered && low_drawdown && free_budget_ok && not_overconcentrated;
+    let can_grow = enough_cycles
+        && growth_gates_ok
+        && robust_without_best
+        && profit_factor.map(|pf| pf >= cfg.scaling.min_recent_profit_factor_for_scale).unwrap_or(false);
+    let should_shrink = enough_cycles
+        && profit_factor.map(|pf| pf < cfg.scaling.min_recent_profit_factor_to_hold).unwrap_or(false);
+
+    let old_size = scaling.leg_size;
+    let new_size = if can_grow {
+        let max_leg = equity * cfg.scaling.max_leg_fraction_of_equity;
+        let target_size = kelly_target_size(scaling, cfg, equity).unwrap_or(old_size * cfg.scaling.scale_growth_factor);
+        target_size.min(max_leg).max(1.0)
+    } else if should_shrink {
+        (old_size * cfg.scaling.scale_shrink_factor).max(1.0)
+    } else {
         tracing::debug!(
             strategy = strategy.key(),
-            recovered, enough_cycles, low_drawdown, profit_factor_ok, robust_without_best,
+            recovered, enough_cycles, low_drawdown, robust_without_best,
             free_budget_ok, not_overconcentrated, distinct_symbols,
+            profit_factor = profit_factor.unwrap_or(0.0),
             exposure_utilization = if strategy_limit > 0.0 { current_exposure / strategy_limit } else { 0.0 },
             "escalonamento negado — condição de evidência não atendida"
         );
         return Vec::new();
-    }
+    };
 
-    let old_size = scaling.leg_size;
-    let max_leg = equity * cfg.scaling.max_leg_fraction_of_equity;
-    let target_size = kelly_target_size(scaling, cfg, equity).unwrap_or(old_size * cfg.scaling.scale_growth_factor);
-    let new_size = target_size.min(max_leg).max(1.0);
     scaling.cycles_since_scale = 0;
     scaling.last_scale_at = Instant::now();
 
@@ -1268,7 +1379,9 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
         old_leg_size = old_size,
         new_leg_size = new_size,
         equity,
-        "condições de escalonamento atendidas: ajustando perna (Kelly fracionário)"
+        profit_factor = profit_factor.unwrap_or(0.0),
+        acao = if can_grow { "crescimento" } else { "redução ativa por PF degradado" },
+        "condições de escalonamento atendidas: ajustando perna"
     );
     scaling.leg_size = new_size;
     vec![ScaleEvent {
