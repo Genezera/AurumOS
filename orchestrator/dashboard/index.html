@@ -1298,7 +1298,7 @@ function renderRiskTab() {
       <div class="kpi"><div class="l">Alavancagem máx. (líquidos)</div><div class="v">${cfg.leverage_liquid_max.toFixed(1)}x</div></div>
       <div class="kpi"><div class="l">Alavancagem máx. (launch)</div><div class="v">${cfg.leverage_launch_max.toFixed(1)}x</div></div>
       <div class="kpi"><div class="l">Ciclos p/ escalonar</div><div class="v">${cfg.min_cycles_between_scale}</div></div>
-      <div class="kpi"><div class="l">Drawdown p/ reduzir perna</div><div class="v">${fmtPct(cfg.drawdown_halve_threshold_pct)}</div></div>
+      <div class="kpi"><div class="l">Teto de perna começa (drawdown)</div><div class="v">${fmtPct(cfg.drawdown_halve_threshold_pct)}</div></div>
     </div>
     <div class="panel">
       <h2>Limite por estratégia vs. exposição atual</h2>

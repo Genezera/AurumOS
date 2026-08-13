@@ -547,7 +547,14 @@ pub fn evaluate(
         return Err(RejectReason::LeverageTooHigh);
     }
 
-    let order_size = opp.capital_needed.min(portfolio.leg_size(opp.strategy));
+    // Teto de drawdown (auditoria externa, 12/08/2026 — ver
+    // drawdown_ceiling_multiplier): aplicado aqui, no tamanho EFETIVO da
+    // ordem, nunca mutando o leg_size armazenado — a estrategia continua
+    // livre pra escalonar via Kelly/recuperacao parcial (Secao 9.1) mesmo
+    // com o portfolio em drawdown; so o que ela pode USAR agora fica
+    // temporariamente menor.
+    let leg_size = portfolio.leg_size(opp.strategy) * drawdown_ceiling_multiplier(portfolio.drawdown_pct());
+    let order_size = opp.capital_needed.min(leg_size);
 
     // Nunca aumentar o tamanho da ordem em uma estratégia logo após uma perda.
     if portfolio.last_outcome_by_strategy.get(&opp.strategy) == Some(&TradeOutcome::Loss) {
@@ -717,14 +724,14 @@ fn positive_excluding_best_trade(recent_pnls: &VecDeque<f64>, min_samples: usize
     Some(total - best.max(0.0) > 0.0)
 }
 
-/// Reduz a perna de TODAS as estratégias pela metade — gatilho de segurança
-/// portfolio-wide (aviso preventivo de drawdown diário, ou drawdown desde o
-/// pico ultrapassando `drawdown_halve_threshold_pct`). Diferente do aumento
-/// (que é por estratégia — task #97), a redução de emergência continua
-/// global de propósito: um drawdown de portfólio é sinal de que TODAS as
-/// estratégias devem operar menor agora, não só a que "causou" o problema —
-/// nenhuma delas tem como saber sozinha que o portfólio inteiro está em
-/// apuros.
+/// Reduz a perna de TODAS as estratégias pela metade — usado só pelo aviso
+/// preventivo de drawdown DIÁRIO (transição única, guardada em
+/// orchestrator.rs por `is_warned != was_warned`, nunca chamada a cada
+/// trade). O gatilho por drawdown desde o pico histórico usava isto
+/// também até 12/08/2026, mas era chamado a cada trade enquanto o
+/// drawdown ficasse acima do limiar — reduzindo repetidas vezes até o
+/// piso; substituído por `drawdown_ceiling_multiplier` (não-destrutivo,
+/// função pura do drawdown atual, ver `evaluate()`).
 pub fn halve_all_legs(portfolio: &mut PortfolioState) -> Vec<ScaleEvent> {
     let mut events = Vec::new();
     for (&strategy, scaling) in portfolio.strategy_scaling.iter_mut() {
@@ -742,6 +749,33 @@ pub fn halve_all_legs(portfolio: &mut PortfolioState) -> Vec<ScaleEvent> {
         }
     }
     events
+}
+
+// Escada de recuperação de drawdown (auditoria externa, 12/08/2026).
+// Valores fixos por enquanto (não expostos em risk.toml ainda) — degraus
+// absolutos de drawdown desde o pico do portfólio, não relativos a
+// nenhum outro parâmetro.
+const DRAWDOWN_CEILING_TIER_1: f64 = 0.0175; // acima disto: metade
+const DRAWDOWN_CEILING_TIER_2: f64 = 0.015; // abaixo de 1,75%: 65%
+const DRAWDOWN_CEILING_TIER_3: f64 = 0.01; // abaixo de 1,50%: 80%
+// abaixo de 1%: sem teto (100%)
+
+/// Teto NÃO-DESTRUTIVO sobre o tamanho efetivo da ordem, em função do
+/// drawdown ATUAL do portfólio — substitui a antiga mutação repetida de
+/// `leg_size` via `halve_all_legs` a cada trade. Por ser uma função pura
+/// recalculada do zero a cada chamada (nunca acumula, nunca precisa de
+/// "já reduzi essa vez?"), relaxa sozinha assim que o portfólio recupera,
+/// sem exigir lógica de recuperação separada nem estado extra.
+fn drawdown_ceiling_multiplier(drawdown: f64) -> f64 {
+    if drawdown >= DRAWDOWN_CEILING_TIER_1 {
+        0.50
+    } else if drawdown >= DRAWDOWN_CEILING_TIER_2 {
+        0.65
+    } else if drawdown >= DRAWDOWN_CEILING_TIER_3 {
+        0.80
+    } else {
+        1.0
+    }
 }
 
 /// Sizing contínuo estilo Kelly fracionário (task #99): em vez do degrau
@@ -791,17 +825,18 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
     portfolio.peak_equity = portfolio.peak_equity.max(portfolio.equity);
     let drawdown = portfolio.drawdown_pct();
 
-    if drawdown >= cfg.scaling.drawdown_halve_threshold_pct {
-        let events = halve_all_legs(portfolio);
-        if !events.is_empty() {
-            tracing::warn!(
-                drawdown_pct = drawdown * 100.0,
-                count = events.len(),
-                "drawdown acima do limite: reduzindo perna de todas as estrategias pela metade"
-            );
-        }
-        return events;
-    }
+    // Redução destrutiva por drawdown removida daqui (auditoria externa,
+    // 12/08/2026): antes, chamava halve_all_legs a cada trade enquanto
+    // drawdown >= limiar, o que reduzia a perna pela metade REPETIDAMENTE —
+    // não uma vez, a cada ciclo — até colapsar no piso de US$1 e nunca
+    // recuperar sozinho (uma única redução real levaria US$25 pra
+    // US$12,50, não pra US$1; a repetição é que colapsava tudo). A
+    // proteção contra drawdown agora é um teto não-destrutivo aplicado no
+    // tamanho EFETIVO da ordem (ver drawdown_ceiling_multiplier, usado em
+    // evaluate()) — o leg_size armazenado nunca é mutado por drawdown, só
+    // pelo escalonamento por Kelly/recuperação parcial abaixo. O gate
+    // `low_drawdown` logo adiante já impede escalonar em cima de um
+    // drawdown elevado, então nenhuma proteção foi perdida.
 
     let equity = portfolio.equity;
     let Some(scaling) = portfolio.strategy_scaling.get_mut(&strategy) else {
