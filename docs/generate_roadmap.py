@@ -269,7 +269,7 @@ def draw_cover(canv, doc):
 
     canv.setFont("JetBrainsMono", 9.5)
     canv.setFillColor(GOLD_BG)
-    canv.drawString(24 * mm, page_h - 115 * mm, "v4.1 — Kelly hierarquico, correcao de drawdown, persistencia de edge, 12/08/2026")
+    canv.drawString(24 * mm, page_h - 115 * mm, "v4.2 — Order Flow corrigido p/ spot real, ranking ao vivo, dashboard detalhado, 12/08/2026")
 
     canv.setFont("Inter", 8.5)
     canv.setFillColor(colors.HexColor("#8B96A3"))
@@ -308,7 +308,7 @@ def build():
     story.append(Spacer(1, 8))
     story.append(section_table([
         ["Campo", "Valor"],
-        ["Data do documento", "12 de agosto de 2026 (v4.1 — historico de revisoes na Secao 0 abaixo)"],
+        ["Data do documento", "12 de agosto de 2026 (v4.2 — historico de revisoes na Secao 0 abaixo)"],
         ["Capital inicial de referencia", "US$ 200 (US$100 Bybit + US$100 Bitget) — ver decisao pendente na Secao 8"],
         ["Status atual", "Fase 0 concluida; Fase 1/2 em paper trading com dado real; universo de simbolos, escalonamento e Kelly hierarquico reescritos nesta revisao (Secoes 1.4, 1.5, 9)"],
         ["Modo de operacao", "Paper trading — sem dinheiro real conectado"],
@@ -345,7 +345,7 @@ def build():
          "nunca disparava porque as metricas nunca cruzavam seus limiares ao mesmo tempo no mesmo "
          "simbolo, mesmo cada uma cruzando o dela centenas de vezes isoladamente (Secao 2.3) — zero "
          "sinais em 24h de operacao real viraram 10 candidatos nos primeiros 90s apos a correcao."],
-        ["v4.1 (esta)", "12/08/2026", "Auditoria externa adicional, mesma sessao: corrigido bug real "
+        ["v4.1", "12/08/2026", "Auditoria externa adicional, mesma sessao: corrigido bug real "
          "onde a reducao de drawdown era aplicada A CADA TRADE (nao so na transicao), colapsando a "
          "perna ate o piso de US$1 sem nunca recuperar sozinha — substituida por um teto nao-destrutivo "
          "em escada (Secao 9.1). Kelly passa a ter uma segunda camada por SIMBOLO dentro de cada "
@@ -360,6 +360,19 @@ def build():
          "e a cada 30s, recarregado no boot. Dashboard: paineis que pareciam quebrados ou desconectados "
          "(pulso de estrategias sem trade, cockpit de risco com caminho de arquivo cru, exposicao "
          "sempre vazia) corrigidos com motivo real explicado em vez de espaco vazio."],
+        ["v4.2 (esta)", "12/08/2026", "Order Flow tinha o mesmo bug ja corrigido para Arbitragem na "
+         "v4.0 (universo de simbolos da categoria errada), so que em DUAS camadas: conectava no book "
+         "SPOT da Bybit mas recebia lista de simbolos do universo LINEAR, e mesmo apos corrigir a fonte "
+         "a logica de bootstrap ainda vazava simbolos invalidos da semente original — sete simbolos "
+         "(MKRUSDT, FTMUSDT, EOSUSDT, ONEUSDT, ZECUSDT, DASHUSDT, STORJUSDT) que existem como perpetuo "
+         "mas nao como par spot ficavam presos em zero amostras para sempre (Secao 1.4.1). Corrigidas "
+         "as duas camadas; cobertura de simbolos com amostra real no universo de perpetuos mais que "
+         "triplicou (60 -> 208) na primeira rotacao apos a correcao. Ranking exibido no dashboard "
+         "(media/amostras por simbolo) passa a reemitir a cada 5 segundos entre rotacoes de 15min, em "
+         "vez de só na propria rotacao — esclarecimento importante registrado: a DECISAO de operar ja "
+         "era 100% em tempo real desde sempre, só a EXIBICAO estava atrasada (Secao 1.4.1). Detalhamento "
+         "completo das correcoes de dashboard da v4.1 (pulso de estrategias, cockpit de risco, "
+         "exposicao por estrategia) na nova Secao 11.1."],
     ], [70, 60, 350]))
     story.append(Spacer(1, 6))
     story.append(callout_box(
@@ -512,6 +525,47 @@ def build():
         "<b>Isto amplia a busca sem inflar edge artificialmente</b> — nenhum limiar de decisao (Secao "
         "7.1) foi tocado; o que mudou e quanto do mercado real o sistema efetivamente olha antes de "
         "decidir.", "Body"))
+
+    story.append(P("1.4.1 Order Flow tambem preso em simbolos inexistentes — mesmo bug, duas camadas (12/08/2026)", "H2"))
+    story.append(P(
+        "Pergunta direta do usuario ao notar varios simbolos travados em \"0 amostras\" para sempre no "
+        "ranking do universo de perpetuos (nao so os recem-explorados, que ainda nao tiveram tempo — "
+        "esses especificos nunca mudavam): \"porque os outros simbolos nao estao mudando?\". Causa raiz, "
+        "confirmada direto na API da propria Bybit: Order Flow conecta no book <b>SPOT</b> da Bybit para "
+        "medir edge, mas recebia a lista de simbolos vinda do universo <b>LINEAR</b> (perpetuos) — sete "
+        "simbolos da semente original (MKRUSDT, FTMUSDT, EOSUSDT, ONEUSDT, ZECUSDT, DASHUSDT, STORJUSDT) "
+        "existem como perpetuo mas <b>nao existem como par spot</b>. Nao era \"ainda nao mediu\" — era "
+        "\"nunca vai medir\", estruturalmente. Mesma classe de bug ja corrigida para Arbitragem na Secao "
+        "1.4 (universo compartilhado por engano entre mercados diferentes).", "Body"))
+    story.append(P(
+        "Corrigido em duas camadas, a segunda achada só ao verificar a primeira ao vivo:", "Body"))
+    story.append(bullets([
+        "<b>Fonte do simbolo</b> — Order Flow passou a usar o mesmo universo dinamico spot que a "
+        "Arbitragem ja usa, em vez do universo linear.",
+        "<b>A semente do \"primeiro ciclo\" ainda vazava simbolos invalidos</b> — mesmo depois da "
+        "correcao acima, os sete simbolos continuaram aparecendo na assinatura do Order Flow. Causa: a "
+        "logica de bootstrap de <font face='JetBrainsMono'>rotate()</font> forcava a semente inteira "
+        "(pensada para perpetuos) dentro de QUALQUER universo no primeiro ciclo, sem checar se aquele "
+        "simbolo existe de verdade na categoria — inclusive no universo spot. Corrigido: só entra da "
+        "semente o que esta presente no pool de candidatos REAL desta categoria (vindo da propria "
+        "Bybit).",
+    ]))
+    story.append(callout_box(
+        "<b>Efeito medido ao vivo:</b> cobertura de simbolos com amostra real no universo de perpetuos "
+        "mais que triplicou (60 &#8594; 208 simbolos) na primeira rotacao apos a correcao — o Order Flow "
+        "estava, sem saber, gritando no vazio para sete simbolos o tempo todo em vez de medir o resto do "
+        "mercado.",
+        border_color=POSITIVE, bg=colors.HexColor("#E4F5EE"),
+    ))
+    story.append(P(
+        "Tambem nesta revisao: o RANKING exibido no dashboard (media/amostras por simbolo) passou a "
+        "reemitir a cada 5 segundos em vez de só a cada rotacao de 15 minutos — pergunta do usuario ao "
+        "ver o numero do GRTUSDT mudar: \"nao tem como ver o edge de todos os ativos em tempo real?\". "
+        "Esclarecimento: a DECISAO de operar ja era 100% em tempo real desde sempre (net_edge calculado "
+        "a cada tick de book recebido, comparado ao limiar na hora, independente desta tabela) — só a "
+        "EXIBICAO estava atrasada. A lista de quem fica ativo continua trocando só a cada 15min, de "
+        "proposito (evita promover/rebaixar um simbolo por causa de um tick ruidoso isolado); só o "
+        "numero mostrado ficou mais vivo.", "Body"))
 
     story.append(P("1.5 Fusao entre modulos (12/08/2026)", "H2"))
     story.append(P(
@@ -1151,6 +1205,37 @@ def build():
         "Grotesk (titulos) + Inter (corpo) + JetBrains Mono (dados/numeros), logo oficial, sumario "
         "com numeros de pagina, e este diagrama de arquitetura vetorial substituindo o espaco em "
         "branco da v1.", "Body"))
+
+    story.append(P("11.1 Paineis que pareciam quebrados corrigidos com motivo real (12/08/2026)", "H2"))
+    story.append(P(
+        "Feedback direto do usuario usando o dashboard ao vivo: \"não estou gostando desse pulso das "
+        "estratégias, só tem 2 com gráficos... cockpit de risco eu não sei no que ele está conectado... "
+        "não tem nenhuma exposição por estratégia\". Em todos os tres casos, o painel nao estava com "
+        "dado errado — estava mostrando um espaco vazio sem nenhuma explicacao do porque, o que se le "
+        "como \"quebrado\" mesmo sendo o comportamento esperado do sistema:", "Body"))
+    story.append(bullets([
+        "<b>Pulso das estrategias</b> — as 7 estrategias sem nenhum trade mostravam um grafico de PnL "
+        "vazio (uma linha reta quase invisivel). Substituido por um card de estado \"dormente\" com o "
+        "motivo real e verificado — Macro so dispara numa janela de -5/+15min ao redor de FOMC/CPI/NFP, "
+        "Launch Radar so em listagem nova, Multi-Asset so no horario de pregao de NY, etc.",
+        "<b>Cockpit de risco</b> — a linha \"Manual (data/KILL)\" expunha um caminho de arquivo cru sem "
+        "contexto. Virou \"Parada manual de emergencia\" com texto explicando que e acionada por quem "
+        "opera o servidor, nao por regra automatica; o resumo do painel agora diz explicitamente que "
+        "esta conectado ao drawdown real do portfolio, recalculado a cada ciclo, direto de risk.toml.",
+        "<b>Exposicao por estrategia</b> — a tabela ficava sempre vazia por natureza (o modelo de "
+        "execucao round-trip fecha cada ordem no mesmo ciclo, entao \"risco aberto\" quase sempre e "
+        "US$0 entre snapshots), sem nenhuma explicacao. Agora mostra sempre, para as 9 estrategias: "
+        "limite de risco configurado + perna atual — o que realmente fica conectado a "
+        "<font face='JetBrainsMono'>risk.toml</font> e ao escalonamento por Kelly, com a exposicao "
+        "aberta instantanea como coluna extra quando existir.",
+    ]))
+    story.append(callout_box(
+        "Um bug real foi encontrado e corrigido no proprio processo desta correcao (nao chegou a ser "
+        "reportado como pronto sem checar): o percentual de limite de risco por estrategia estava sendo "
+        "multiplicado por 100 duas vezes (uma no backend, outra no JavaScript), mostrando 35% em vez de "
+        "0,35%. Pego antes de qualquer commit.",
+        border_color=GOLD, bg=GOLD_SOFT,
+    ))
 
     story.append(P("12. Provedores e integracoes — pesquisa e estado atual", "H1"))
     story.append(P(
