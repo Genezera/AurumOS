@@ -19,11 +19,25 @@ use crate::events::{DashboardEvent, EventBus, SymbolRanking};
 /// perpétuos USDT da Bybit — não uma lista fixa escolhida à mão.
 
 const EDGE_HISTORY_CAP: usize = 500;
-const ROTATION_INTERVAL: Duration = Duration::from_secs(2 * 3600);
-const TOTAL_TARGET: usize = 80;
-const MIN_EXPLORATION_SLOTS: usize = 15;
+// Pedido do usuário (12/08/2026): "quero que continue rápido, dinâmico,
+// acelerado... pesquise o mercado inteiro globalmente, uma pool
+// extremamente maior... quero que aprenda... encontrando o melhor mercado".
+// Rotação de 2h→15min: reavalia quem está realmente com edge medido MUITO
+// mais rápido — um símbolo que esfriar sai da lista de "comprovados" em
+// minutos, não horas, e libera vaga pra exploração sem esperar o ciclo
+// antigo de 2h. Universo alvo 80→220 e vagas de exploração 15→50: cobre uma
+// fatia bem maior do mercado real (Bybit linear tem ~500 pares USDT) em vez
+// de só 80, e explora candidatos novos numa taxa proporcionalmente maior a
+// cada rotação — sem inventar edge, só olhando mais mercado, mais rápido.
+const ROTATION_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const TOTAL_TARGET: usize = 220;
+const MIN_EXPLORATION_SLOTS: usize = 50;
 const MIN_SAMPLES_TO_TRUST: usize = 200;
 const BYBIT_TICKERS_URL: &str = "https://api.bybit.com/v5/market/tickers?category=linear";
+// Top-N por volume 24h vindo da Bybit — teto do pool de candidatos, não do
+// que fica ativo (isso é TOTAL_TARGET). Ampliado de 250 pra cobrir
+// praticamente todo o mercado linear USDT líquido da exchange.
+const CANDIDATE_POOL_CAP: usize = 450;
 
 #[derive(Debug, Clone, Default)]
 pub struct EdgeStats {
@@ -207,8 +221,8 @@ fn persist(active: &[String], scores: &EdgeScores) {
 
 /// Lista completa de perpétuos USDT ativos na Bybit, ordenada por
 /// `turnover24h` (volume em dólar nas últimas 24h) — filtro de liquidez
-/// mínima real, não uma lista escolhida à mão. Top 250 por volume vira o
-/// pool de candidatos pra exploração.
+/// mínima real, não uma lista escolhida à mão. Top CANDIDATE_POOL_CAP por
+/// volume vira o pool de candidatos pra exploração.
 async fn fetch_candidate_pool() -> anyhow::Result<Vec<String>> {
     let client = reqwest::Client::builder()
         .user_agent("AurumOS-ResearchBot/0.1")
@@ -235,6 +249,6 @@ async fn fetch_candidate_pool() -> anyhow::Result<Vec<String>> {
         })
         .collect();
     with_volume.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    with_volume.truncate(250);
+    with_volume.truncate(CANDIDATE_POOL_CAP);
     Ok(with_volume.into_iter().map(|(s, _)| s).collect())
 }

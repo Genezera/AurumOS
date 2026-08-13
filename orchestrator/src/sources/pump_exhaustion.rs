@@ -64,6 +64,27 @@ const LIQUIDATION_FUSION_WINDOW: Duration = Duration::from_secs(15 * 60);
 // suficiente pra reforçar um candidato de exaustão.
 const WHALE_FUSION_THRESHOLD_USD: f64 = 2_000_000.0;
 
+// Recalibrado em 12/08/2026 a partir de 6.000 amostras reais recentes
+// (universo dinâmico de 87 símbolos, raw_pump_exhaustion.jsonl): o gatilho
+// antigo ("2 de 3 sinais booleanos", cada um calibrado por PERCENTIL
+// MARGINAL isolado) partia da premissa implícita de que os 3 sinais
+// coocorrem no mesmo símbolo — não coocorrem. Em 3.000 amostras: funding
+// cruzou o limiar 249 vezes, pump 175 vezes, OI 4 vezes, mas NUNCA dois ao
+// mesmo tempo no mesmo símbolo (0 ocorrências de signals_true>=2 em 24h de
+// operação real). Resultado: zero sinais emitidos, mesmo com dado passando
+// perto do limiar o tempo todo — o gate estava estruturalmente inatingível,
+// não só raro.
+//
+// exhaustion_score() já calcula a combinação ponderada contínua das 3
+// dimensões (usada até agora só pro heartbeat do dashboard); a distribuição
+// REAL desse score nas mesmas 6.000 amostras tem espalhamento genuíno
+// (p50=0,27 p75=0,43 p90=0,58 p95=0,72 p99=0,91) — calibrar o gatilho
+// diretamente no percentil real do score (em vez de tentar re-calibrar 3
+// limiares marginais pra um co-ocorrência que na prática não acontece) é o
+// que reflete o dado observado sem inflar a seletividade de forma artificial.
+const EXHAUSTION_SCORE_TRIGGER: f64 = 0.60; // ~p90 real observado — sinal forte, dispara sozinho
+const EXHAUSTION_SCORE_WEAK: f64 = 0.40; // ~p75 — só dispara combinado com reforço de fusão
+
 // --- Camada de confirmação por preço (roadmap Seção 0: "toda oportunidade
 // de ouro é tratada como hipótese, não fato... precisa de confirmação de
 // preço/livro/volume antes de virar ordem") ---
@@ -133,16 +154,20 @@ impl SignalSource for PumpExhaustionSource {
     }
 
     async fn run(&mut self, tx: Sender<Opportunity>) -> anyhow::Result<()> {
-        // Vive fora de run_once de propósito: uma queda de conexão (comum,
+        // Vivem fora de run_once de propósito: uma queda de conexão (comum,
         // já tratada com reconexão automática) não pode apagar semanas de
         // histórico de confirmação acumulado — só ele que torna net_edge
-        // real possível. Sobrevive também à troca de universo de símbolos,
-        // pelo mesmo motivo.
+        // real possível. Sobrevivem também à troca de universo de símbolos
+        // (agora a cada 15min — 12/08/2026, pedido do usuário por rotação
+        // mais rápida), pelo mesmo motivo: sem isso, oi_history nunca
+        // acumularia os 50min mínimos exigidos pra confiar no crescimento de
+        // OI, cegando permanentemente essa dimensão do score.
         let mut confirmation_history: VecDeque<f64> = VecDeque::new();
+        let mut oi_history: HashMap<String, VecDeque<(Instant, f64)>> = HashMap::new();
         loop {
             let symbols = self.symbols_rx.borrow().clone();
             tokio::select! {
-                result = run_once(&symbols, &tx, &self.bus, &mut confirmation_history, &self.liquidation_board, &self.whale_board) => {
+                result = run_once(&symbols, &tx, &self.bus, &mut confirmation_history, &mut oi_history, &self.liquidation_board, &self.whale_board) => {
                     if let Err(e) = result {
                         tracing::warn!(error = %e, "conexão de pump exhaustion (Bybit linear) caiu, reconectando em 3s");
                     }
@@ -156,24 +181,33 @@ impl SignalSource for PumpExhaustionSource {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_once(
     symbols: &[String],
     tx: &Sender<Opportunity>,
     bus: &EventBus,
     confirmation_history: &mut VecDeque<f64>,
+    oi_history: &mut HashMap<String, VecDeque<(Instant, f64)>>,
     liquidation_board: &LiquidationBoard,
     whale_board: &WhaleBoard,
 ) -> anyhow::Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(BYBIT_LINEAR_WS_URL).await?;
     let (mut sink, mut stream) = ws.split();
 
+    // Chunked em lotes de 10 tópicos por mensagem (mesmo padrão de
+    // arbitrage.rs/order_flow.rs/liquidation_hunter.rs) — antes mandava tudo
+    // numa mensagem só, o que funcionava com ~70 símbolos mas arrisca
+    // rejeição da Bybit com o universo ampliado (task de 12/08/2026: "pool
+    // extremamente maior pesquisando todo o mercado").
+    const CHUNK_SIZE: usize = 10;
     let args: Vec<String> = symbols.iter().map(|s| format!("tickers.{s}")).collect();
-    sink.send(WsMessage::Text(serde_json::json!({ "op": "subscribe", "args": args }).to_string()))
-        .await?;
-    tracing::info!(exchange = "bybit_linear", ?symbols, "pump exhaustion: assinatura de tickers enviada");
+    for chunk in args.chunks(CHUNK_SIZE) {
+        sink.send(WsMessage::Text(serde_json::json!({ "op": "subscribe", "args": chunk }).to_string()))
+            .await?;
+    }
+    tracing::info!(exchange = "bybit_linear", ?symbols, lotes = args.len().div_ceil(CHUNK_SIZE), "pump exhaustion: assinatura de tickers enviada");
 
     let mut state: HashMap<String, TickerState> = HashMap::new();
-    let mut oi_history: HashMap<String, std::collections::VecDeque<(Instant, f64)>> = HashMap::new();
     let mut last_emitted: HashMap<String, Instant> = HashMap::new();
     let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
     let mut watchdog = tokio::time::interval(Duration::from_secs(5));
@@ -366,14 +400,14 @@ async fn handle_message(
         );
     }
 
-    let funding_extreme = snapshot.funding_rate.abs() > FUNDING_EXTREME;
-    let big_pump = snapshot.price_24h_pcnt > PUMP_24H_PCNT;
-    let oi_growing = snapshot.oi_growth_1h_pct > OI_GROWTH_1H_EXTREME;
-    // Combinação ponderada (Fase 6 do roadmap): exige pelo menos 2 das 3
-    // dimensões extremas ao mesmo tempo, não uma única métrica isolada nem
-    // as 3 obrigatoriamente — cada par (funding+pump, funding+OI, pump+OI)
-    // já é um padrão de exaustão plausível sozinho.
-    let signals_true = [funding_extreme, big_pump, oi_growing].iter().filter(|&&b| b).count();
+    // Gatilho por score contínuo (revisão 12/08/2026 — ver comentário em
+    // EXHAUSTION_SCORE_TRIGGER acima): o "2 de 3 booleanos" antigo nunca
+    // coocorria de verdade no dado real, travando o módulo em zero sinais
+    // por 24h+ mesmo com 87 símbolos monitorados. O score pondera as 3
+    // dimensões continuamente — usar o próprio percentil real dele como
+    // limiar dispara quando o CONJUNTO está esticado, não quando 2 métricas
+    // isoladas cruzam limiares que raramente se encontram no mesmo símbolo.
+    let score = exhaustion_score(&snapshot);
 
     // Fusão (pedido do usuário, 13/08/2026 — "faça intercomunicação"):
     // Whale Watch e Liquidation Hunter já coletam dado real do mesmo mercado
@@ -381,14 +415,17 @@ async fn handle_message(
     // "pump + depósitos de whales em exchange + liquidações compradoras
     // crescendo = candidato forte de exaustão". Uma cascata de liquidação de
     // LONGS neste símbolo específico, ou pressão agregada de depósito em
-    // exchanges conhecidas (mercado geral), contam como reforço — com pelo
-    // menos 1 sinal próprio E 1 reforço externo, dispensa o 2º sinal próprio.
+    // exchanges conhecidas (mercado geral), contam como reforço — com o
+    // score já moderadamente esticado (EXHAUSTION_SCORE_WEAK) MAIS pelo
+    // menos 1 reforço externo, dispensa o score forte sozinho.
     let fusion_liq = recent_long_liquidation_cascade(liquidation_board, symbol, LIQUIDATION_FUSION_WINDOW);
     let fusion_whale_usd = recent_deposit_pressure_usd(whale_board);
     let fusion_whale = fusion_whale_usd > WHALE_FUSION_THRESHOLD_USD;
     let fusion_count = [fusion_liq, fusion_whale].iter().filter(|&&b| b).count();
 
-    if signals_true < 2 && !(signals_true >= 1 && fusion_count >= 1) {
+    let strong_signal = score >= EXHAUSTION_SCORE_TRIGGER;
+    let weak_signal_with_fusion = score >= EXHAUSTION_SCORE_WEAK && fusion_count >= 1;
+    if !(strong_signal || weak_signal_with_fusion) {
         return;
     }
 
@@ -440,6 +477,7 @@ async fn handle_message(
 
     tracing::info!(
         symbol,
+        score,
         funding_rate_pct = snapshot.funding_rate * 100.0,
         change_24h_pct = snapshot.price_24h_pcnt * 100.0,
         oi_growth_1h_pct = snapshot.oi_growth_1h_pct * 100.0,
