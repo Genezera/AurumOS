@@ -269,7 +269,7 @@ def draw_cover(canv, doc):
 
     canv.setFont("JetBrainsMono", 9.5)
     canv.setFillColor(GOLD_BG)
-    canv.drawString(24 * mm, page_h - 115 * mm, "v4.0 — universo dinamico, fusao entre modulos, escalonamento por estrategia, 12/08/2026")
+    canv.drawString(24 * mm, page_h - 115 * mm, "v4.1 — Kelly hierarquico, correcao de drawdown, persistencia de edge, 12/08/2026")
 
     canv.setFont("Inter", 8.5)
     canv.setFillColor(colors.HexColor("#8B96A3"))
@@ -308,9 +308,9 @@ def build():
     story.append(Spacer(1, 8))
     story.append(section_table([
         ["Campo", "Valor"],
-        ["Data do documento", "12 de agosto de 2026 (v4.0 — historico de revisoes na Secao 0 abaixo)"],
+        ["Data do documento", "12 de agosto de 2026 (v4.1 — historico de revisoes na Secao 0 abaixo)"],
         ["Capital inicial de referencia", "US$ 200 (US$100 Bybit + US$100 Bitget) — ver decisao pendente na Secao 8"],
-        ["Status atual", "Fase 0 concluida; Fase 1/2 em paper trading com dado real; universo de simbolos e escalonamento reescritos nesta revisao (Secoes 1.4, 1.5, 9)"],
+        ["Status atual", "Fase 0 concluida; Fase 1/2 em paper trading com dado real; universo de simbolos, escalonamento e Kelly hierarquico reescritos nesta revisao (Secoes 1.4, 1.5, 9)"],
         ["Modo de operacao", "Paper trading — sem dinheiro real conectado"],
         ["Regra inegociavel", "O assistente nunca ativa nem conecta capital real sozinho — ver Secao 10"],
     ], [160, 330]))
@@ -332,7 +332,7 @@ def build():
          "rigoroso (PF>=1.2 + robustez a outlier), Fase 11 com exigencia de distribuicao temporal, "
          "universo de simbolos ampliado, cockpit de risco no dashboard, e esta consolidacao de "
          "contradicoes internas que se acumularam entre v2/v2.1/v3.0."],
-        ["v4.0 (esta)", "12/08/2026", "Sessao de pedido explicito do usuario ('quero tudo "
+        ["v4.0", "12/08/2026", "Sessao de pedido explicito do usuario ('quero tudo "
          "funcionando', 'faca a fusao', 'estende a busca ampla'): universo de simbolos deixa de ser "
          "uma lista fixa e passa a ser dois universos dinamicos independentes, medidos por edge real "
          "e rotativos a cada 15min (Secao 1.4) — um para os modulos de perpetuos, outro proprio para "
@@ -345,6 +345,21 @@ def build():
          "nunca disparava porque as metricas nunca cruzavam seus limiares ao mesmo tempo no mesmo "
          "simbolo, mesmo cada uma cruzando o dela centenas de vezes isoladamente (Secao 2.3) — zero "
          "sinais em 24h de operacao real viraram 10 candidatos nos primeiros 90s apos a correcao."],
+        ["v4.1 (esta)", "12/08/2026", "Auditoria externa adicional, mesma sessao: corrigido bug real "
+         "onde a reducao de drawdown era aplicada A CADA TRADE (nao so na transicao), colapsando a "
+         "perna ate o piso de US$1 sem nunca recuperar sozinha — substituida por um teto nao-destrutivo "
+         "em escada (Secao 9.1). Kelly passa a ter uma segunda camada por SIMBOLO dentro de cada "
+         "estrategia, nao so por estrategia inteira (Secao 9.1). Removida a tabela fixa de concorrencia "
+         "(1/2/3/5 operacoes por faixa de capital) — o proprio orcamento de risco (limite por "
+         "estrategia+correlacao+total) agora decide quantas operacoes cabem no mesmo ciclo. Corrigido "
+         "o problema mais critico apontado pelo usuario: o edge medido por simbolo (EdgeScores) so "
+         "existia em memoria e era zerado a cada restart do processo — com quantos restarts uma sessao "
+         "de testes acumula, isso apagava o aprendizado inteiro toda hora (RVNUSDT chegou a mostrar "
+         "spread crescendo de 0,49% para 0,64% em 21min antes de um restart apagar o progresso, sem "
+         "ter tido tempo de provar se cruzaria o limiar de 0,65%). Agora persiste em disco a cada 15min "
+         "e a cada 30s, recarregado no boot. Dashboard: paineis que pareciam quebrados ou desconectados "
+         "(pulso de estrategias sem trade, cockpit de risco com caminho de arquivo cru, exposicao "
+         "sempre vazia) corrigidos com motivo real explicado em vez de espaco vazio."],
     ], [70, 60, 350]))
     story.append(Spacer(1, 6))
     story.append(callout_box(
@@ -1012,23 +1027,103 @@ def build():
         "antigo vira so um reserva para quando a amostra ainda nao permite estimar Kelly.",
     ]))
     story.append(callout_box(
-        "<b>A reducao de emergencia continua global, de proposito:</b> quando o drawdown do "
-        "PORTFOLIO INTEIRO (nao de uma estrategia) ultrapassa 2%, TODAS as pernas sao reduzidas pela "
-        "metade de uma vez (<font face='JetBrainsMono'>risk::halve_all_legs</font>). Um drawdown "
-        "grande do portfolio e sinal de que todo o sistema deve operar menor agora, nao so a "
-        "estrategia que \"causou\" — nenhuma delas tem como saber sozinha que o portfolio inteiro "
-        "esta em apuros.",
+        "<b>A protecao de emergencia continua global, de proposito:</b> quando o drawdown do "
+        "PORTFOLIO INTEIRO (nao de uma estrategia) ultrapassa certos limiares, o tamanho EFETIVO da "
+        "ordem de TODAS as estrategias e reduzido de uma vez (ver Secao 9.2 — mecanismo corrigido "
+        "depois desta revisao inicial). Um drawdown grande do portfolio e sinal de que todo o sistema "
+        "deve operar menor agora, nao so a estrategia que \"causou\" — nenhuma delas tem como saber "
+        "sozinha que o portfolio inteiro esta em apuros.",
         border_color=GOLD, bg=GOLD_SOFT,
     ))
+
+    story.append(P("9.2 Correcao: reducao de drawdown parou de colapsar a perna ate o piso (auditoria externa, 12/08/2026)", "H2"))
+    story.append(P(
+        "Achado por auditoria tecnica externa e confirmado lendo o codigo: a implementacao inicial da "
+        "Secao 9.1 chamava a reducao de emergencia (halve pela metade) dentro de "
+        "<font face='JetBrainsMono'>maybe_scale</font>, que roda A CADA TRADE — nao so na transicao de "
+        "\"abaixo do limiar\" para \"acima do limiar\". Cada trade novo enquanto o drawdown ficasse "
+        "&#8805;2% reduzia a perna PELA METADE DE NOVO, nao uma vez so — uma unica reducao real levaria "
+        "US$25 para US$12,50, nao para o piso de US$1 observado. Era exatamente esse loop repetido que "
+        "colapsava tudo, e sem nenhuma escada de recuperacao, ficava preso no piso indefinidamente "
+        "mesmo com o drawdown oscilando perto do limiar por horas.", "Body"))
+    story.append(P(
+        "Corrigido com um teto NAO-DESTRUTIVO: em vez de mutar <font face='JetBrainsMono'>leg_size</font> "
+        "permanentemente, o tamanho EFETIVO da ordem e multiplicado por um fator recalculado do zero a "
+        "cada avaliacao, puramente em funcao do drawdown ATUAL — nunca acumula, nunca precisa perguntar "
+        "\"ja reduzi essa vez?\":", "Body"))
+    story.append(section_table([
+        ["Drawdown do portfolio (desde o pico)", "Teto sobre o tamanho efetivo da ordem"],
+        ["&#8805; 1,75%", "50%"],
+        ["&#8805; 1,50%", "65%"],
+        ["&#8805; 1,00%", "80%"],
+        ["< 1,00%", "sem teto (100%)"],
+    ], [280, 210]))
+    story.append(Spacer(1, 4))
+    story.append(P(
+        "Por ser uma funcao pura do drawdown corrente, relaxa sozinha assim que o portfolio recupera — "
+        "sem exigir estado extra nem logica de recuperacao separada. O <font face='JetBrainsMono'>"
+        "leg_size</font> armazenado por estrategia (o que o Kelly fracionario constroi) nunca e mais "
+        "destruido por drawdown; so o quanto dele pode ser usado AGORA fica temporariamente menor.", "Body"))
     story.append(callout_box(
-        "<b>Honesto sobre o estado atual:</b> no momento desta revisao, o portfolio esta ~2,5% abaixo "
-        "do pico historico — acima do limiar de 2% que aciona a reducao de emergencia. Isso significa "
-        "que, na pratica, toda perna esta travada no piso de US$1 e o novo sizing por Kelly ainda nao "
-        "teve chance de mostrar efeito real fora de teste isolado. So volta a escalar quando o equity "
-        "do portfolio recuperar acima de ~98% do pico — isto nao e uma limitacao do codigo novo, e o "
-        "mesmo gate de seguranca que ja existia, agora aplicado de forma mais correta.",
+        "Estes valores de escada sao fixos no codigo por enquanto (nao expostos em risk.toml ainda) — "
+        "escolhidos pela auditoria externa, nao calibrados contra dado real de quanto tempo o "
+        "portfolio efetivamente passa em cada faixa. Proximo passo natural se este mecanismo mostrar "
+        "comportamento estranho: tornar configuravel e revisitar os limiares com mais historico.",
+        border_color=GOLD, bg=GOLD_SOFT,
+    ))
+
+    story.append(P("9.3 Kelly hierarquico — segunda camada por simbolo (auditoria externa, 12/08/2026)", "H2"))
+    story.append(P(
+        "Pedido da auditoria: \"direciona mais capital as melhores estrategias, simbolos e regimes\". "
+        "Escopo desta revisao: as duas primeiras camadas (portfolio&#8594;estrategia&#8594;SIMBOLO) — a "
+        "camada de \"regime\" (classificacao de regime de mercado — tendencia, volatilidade) fica de "
+        "fora por enquanto, nao existe nenhuma infraestrutura de deteccao de regime ainda e construir "
+        "isso agora seria fabricar sofisticacao sem base real medida.", "Body"))
+    story.append(P(
+        "Antes, dois simbolos dentro da mesma estrategia (ex.: QTUMUSDT e GRTUSDT dentro de Order Flow) "
+        "recebiam exatamente o mesmo tamanho de ordem, mesmo com desempenho historico diferente. Agora "
+        "<font face='JetBrainsMono'>risk::SymbolScaling</font> rastreia PnL recente por (estrategia, "
+        "simbolo); o tamanho efetivo da ordem e multiplicado por uma fracao de alocacao — a razao entre "
+        "o Kelly medido DESSE simbolo (ponderado pela amostra: 0 amostras = 100% de heranca do prior da "
+        "estrategia, 50+ amostras = quase todo peso no Kelly proprio) e o Kelly da estrategia inteira, "
+        "limitada a [0,10, 2,00] pra nunca zerar nem inflar um simbolo alem do razoavel a partir de "
+        "amostra ainda ruidosa. Simbolo novo ou pouco visto nunca comeca travado — herda o orcamento da "
+        "estrategia ate provar diferenca propria.", "Body"))
+
+    story.append(P("9.4 Concorrencia por orcamento de risco, nao tabela fixa (auditoria externa, 12/08/2026)", "H2"))
+    story.append(P(
+        "A tabela fixa antiga (1 operacao ate US$499, 2 de US$500-999, 3 de US$1.000-2.499, 5 acima "
+        "disso) limitava artificialmente quantas oportunidades DIFERENTES podiam virar ordem no mesmo "
+        "ciclo, mesmo quando o orcamento de risco real (limite por estrategia + grupo de correlacao + "
+        "total simultaneo de 0,50%) tinha espaco de sobra. Removida: o motor de risco ja reavalia a "
+        "cada iteracao contra o estado ja atualizado pela oportunidade anterior no mesmo ciclo — esse "
+        "e o orcamento real. O loop agora executa ate esse orcamento se esgotar sozinho ou ate um teto "
+        "de sanidade de 50 operacoes por ciclo (nunca mais um limite de negocio, so uma protecao contra "
+        "um ciclo unico rodar indefinidamente).", "Body"))
+
+    story.append(P("9.5 Edge medido passa a sobreviver a restart do processo (12/08/2026)", "H2"))
+    story.append(P(
+        "Pedido direto do usuario apos observar perda de progresso: \"eu nao quero que perde nada "
+        "quando reinicia o sistema\". Ate esta correcao, <font face='JetBrainsMono'>EdgeScores</font> "
+        "(Secao 1.4 — o historico de edge real medido por simbolo, a unica coisa que faz a exploracao e "
+        "o Kelly hierarquico significarem algo) so existia em memoria e era recriado vazio a cada boot "
+        "do processo. Com quantos restarts uma sessao de testes acumula, isso apagava o aprendizado "
+        "inteiro toda hora, mesmo simbolos com centenas de amostras.", "Body"))
+    story.append(callout_box(
+        "<b>Caso real observado antes da correcao:</b> RVNUSDT comecou a acumular spread real no "
+        "universo spot de arbitragem, subindo de +0,49% para +0,64% ao longo de 21 minutos — perto do "
+        "limiar de 0,65% (Secao 7.1). Um restart do processo apagou esse progresso antes que desse pra "
+        "saber se cruzaria o limiar ou nao; o simbolo nao voltou a ser sorteado pela rotacao de "
+        "exploracao desde entao. Nao e um caso hipotetico — foi o motivo concreto que motivou esta "
+        "correcao.",
         border_color=RISK_RED, bg=colors.HexColor("#FBE9EC"),
     ))
+    story.append(P(
+        "Corrigido: o edge medido agora e salvo em disco a cada rotacao (15min) E a cada 30 segundos "
+        "via uma tarefa periodica separada, e recarregado do disco antes da primeira rotacao no boot — "
+        "nunca mais que ~30s de medicao perdida num restart abrupto. Verificado ao vivo reiniciando o "
+        "processo de proposito: log confirma recuperacao do disco, contagem de amostras de simbolos ja "
+        "medidos continuou de onde parou em vez de zerar.", "Body"))
 
     story.append(PageBreak())
 
