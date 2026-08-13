@@ -165,6 +165,25 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move { symbol_universe::run(symbol_universe::SPOT, scores, symbols_tx_spot, seed_symbols, su_bus).await })
     };
 
+    // Salva o edge medido a cada 30s, independente da rotação de 15min
+    // (pedido do usuário, 12/08/2026: "eu não quero que perde nada quando
+    // reinicia o sistema") — `run()` já salva a cada rotação, mas um
+    // restart no meio de uma janela de 15min perderia tudo desde a última
+    // sem isto. Tarefa leve: só serializa o que já está em memória, não
+    // refaz nenhuma medição.
+    let edge_scores_saver_handle = {
+        let scores_linear = edge_scores.clone();
+        let scores_spot = edge_scores_spot.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                iv.tick().await;
+                symbol_universe::save_edge_scores(&scores_linear, symbol_universe::LINEAR.edge_scores_filename);
+                symbol_universe::save_edge_scores(&scores_spot, symbol_universe::SPOT.edge_scores_filename);
+            }
+        })
+    };
+
     // Quadros de fusão (pedido do usuário: "faça a fusão", "faça
     // intercomunicação") — Whale Watch e Liquidation Hunter alimentam,
     // Pump Exhaustion lê como reforço de confiança. Ver fusion.rs.
@@ -292,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
 
     symbol_universe_handle.abort();
     symbol_universe_spot_handle.abort();
+    edge_scores_saver_handle.abort();
     arbitrage_handle.abort();
     order_flow_handle.abort();
     whale_watch_handle.abort();

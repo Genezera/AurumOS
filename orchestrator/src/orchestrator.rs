@@ -36,28 +36,26 @@ const PARTIAL_FILL_MIN_FRACTION: f64 = 0.30;
 /// risco" que arbitragem promete no papel.
 const SECOND_LEG_FAILURE_PROB: f64 = 0.03;
 
-/// Escalonamento por capital do PDF: "US$100 → todos monitoram, uma
-/// estratégia opera; US$200 → arbitragem ativa; US$500 → duas
-/// oportunidades independentes; US$1.000 → cripto e macro/ações
-/// simultaneamente; US$2.500+ → orquestração multiativo completa". Como
-/// todos os módulos já ficam sempre monitorando (é só visibilidade, não
-/// custa capital), a parte que realmente escala aqui é quantas
-/// oportunidades DIFERENTES podem virar ordem no mesmo ciclo — o resto do
-/// motor de risco (limite por estratégia, por grupo de correlação, total)
-/// continua valendo igual, então mais concorrência não vira mais risco por
-/// si só, só mais chance de captar oportunidades que apareceriam e
-/// expirariam antes do próximo ciclo.
-fn max_concurrent_trades(total_equity: f64) -> usize {
-    if total_equity >= 2500.0 {
-        5
-    } else if total_equity >= 1000.0 {
-        3
-    } else if total_equity >= 500.0 {
-        2
-    } else {
-        1
-    }
-}
+/// Concorrência por orçamento de risco (auditoria externa, 12/08/2026):
+/// a tabela fixa antiga (1 operação até US$499, 2 de US$500-999, 3 de
+/// US$1.000-2.499, 5 acima disso) limitava artificialmente o sistema
+/// mesmo quando várias oportunidades pequenas e NÃO correlacionadas
+/// cabiam dentro do orçamento de risco disponível — com US$200 e
+/// universo de 220+220 símbolos, isso significava recusar a 2ª/3ª
+/// oportunidade boa do mesmo ciclo só por causa de um número fixo, não
+/// por falta de risco disponível.
+///
+/// O motor de risco já é o orçamento de risco real: `risk::evaluate`
+/// (chamado a cada iteração dentro de `pick_best`, contra o estado JÁ
+/// ATUALIZADO pela oportunidade anterior no mesmo ciclo) rejeita por
+/// limite de estratégia, grupo de correlação e total simultâneo de
+/// 0,50% — exatamente os três critérios que a auditoria pediu. Não há
+/// mais teto artificial: o loop abaixo executa até esse orçamento se
+/// esgotar sozinho (`pick_best` não acha mais nada aprovado) ou até este
+/// teto de sanidade por tick, o que vier primeiro — ele existe só pra
+/// nunca travar um único tick indefinidamente, não como limite de
+/// negócio.
+const MAX_TRADES_PER_TICK: usize = 50;
 
 /// Roda o loop central: acumula oportunidades chegando dos módulos, a cada
 /// tick escolhe a melhor entre as ainda válidas e aprovadas pelo risk
@@ -149,8 +147,7 @@ pub async fn run(
                     bus.emit(DashboardEvent::risk_warning(kill_status.warn));
                 }
 
-                let total_equity = portfolio.equity + portfolio.protected_reserve + portfolio.infra_reserve;
-                let slots = if is_halted { 0 } else { max_concurrent_trades(total_equity) };
+                let slots = if is_halted { 0 } else { MAX_TRADES_PER_TICK };
                 let mut done_this_tick = 0;
                 let mut hit_cycle_limit = false;
 

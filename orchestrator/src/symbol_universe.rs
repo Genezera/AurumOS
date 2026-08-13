@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
 
@@ -53,22 +54,33 @@ const CANDIDATE_POOL_CAP: usize = 450;
 pub struct UniverseKind {
     pub bybit_category: &'static str,
     pub persist_filename: &'static str,
+    /// Pedido do usuário (12/08/2026): "eu não quero que perde nada quando
+    /// reinicia o sistema" — antes, `EdgeScores` (o histórico de edge
+    /// medido por símbolo, a única coisa que faz a exploração e o
+    /// escalonamento por Kelly significarem algo) só existia em memória e
+    /// era recriado vazio a cada boot. Com quantos restarts uma sessão de
+    /// testes acumula, isso na prática apagava o aprendizado inteiro toda
+    /// hora. Persistido e recarregado aqui, separado de
+    /// `persist_filename` (que é só o ranking pra exibição).
+    pub edge_scores_filename: &'static str,
     pub dashboard_kind: &'static str,
 }
 
 pub const LINEAR: UniverseKind = UniverseKind {
     bybit_category: "linear",
     persist_filename: "active_symbols.json",
+    edge_scores_filename: "edge_scores_linear.json",
     dashboard_kind: "linear",
 };
 
 pub const SPOT: UniverseKind = UniverseKind {
     bybit_category: "spot",
     persist_filename: "active_symbols_spot.json",
+    edge_scores_filename: "edge_scores_spot.json",
     dashboard_kind: "spot",
 };
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EdgeStats {
     recent: VecDeque<f64>,
 }
@@ -109,6 +121,35 @@ pub fn record_edge(scores: &EdgeScores, symbol: &str, net_edge: f64) {
     map.entry(symbol.to_string()).or_default().record(net_edge);
 }
 
+fn edge_scores_path(filename: &str) -> String {
+    format!("{}/data/{filename}", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Recupera o edge medido salvo em disco — se não existir ou estiver
+/// corrompido, começa vazio normalmente (mesmo padrão de
+/// `risk::PortfolioState::load_or_new`: ausência de arquivo não é erro).
+fn load_edge_scores(filename: &str) -> HashMap<String, EdgeStats> {
+    let path = edge_scores_path(filename);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// Salva o edge medido em disco — chamado a cada rotação (15min) E
+/// periodicamente entre rotações (ver `main.rs`), pra nunca perder mais
+/// que alguns segundos de medição num restart abrupto.
+pub fn save_edge_scores(scores: &EdgeScores, filename: &str) {
+    let Ok(map) = scores.lock() else { return };
+    let Ok(json) = serde_json::to_string(&*map) else { return };
+    let path = edge_scores_path(filename);
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, json);
+}
+
 /// Tarefa de fundo: a cada `ROTATION_INTERVAL`, busca a lista completa de
 /// perpétuos USDT da Bybit (ordenada por volume 24h — filtro de liquidez
 /// mínima, não filtro de "achismo"), decide a lista ativa com base no edge
@@ -121,6 +162,19 @@ pub async fn run(kind: UniverseKind, scores: EdgeScores, tx: watch::Sender<Vec<S
     let mut exploration_cursor: usize = 0;
     let mut candidate_pool: Vec<String> = seed.clone();
     let mut first_round = true;
+
+    // Recupera o edge medido de sessões anteriores ANTES da primeira
+    // rotação — sem isso, um restart (ainda que segundos depois de um
+    // save) descartaria todo o histórico acumulado e a primeira rotação
+    // trataria tudo como "nunca visto", igual a um boot do zero.
+    let restored = load_edge_scores(kind.edge_scores_filename);
+    if !restored.is_empty() {
+        let count = restored.len();
+        if let Ok(mut map) = scores.lock() {
+            *map = restored;
+        }
+        tracing::info!(simbolos = count, categoria = kind.bybit_category, "universo de símbolos: edge medido recuperado do disco");
+    }
 
     loop {
         match fetch_candidate_pool(kind.bybit_category).await {
@@ -139,6 +193,7 @@ pub async fn run(kind: UniverseKind, scores: EdgeScores, tx: watch::Sender<Vec<S
         let active = rotate(&scores, &candidate_pool, &seed, first_round, &mut exploration_cursor);
         first_round = false;
         persist(&active, &scores, kind.persist_filename);
+        save_edge_scores(&scores, kind.edge_scores_filename);
         tracing::info!(total = active.len(), categoria = kind.bybit_category, "universo de símbolos: rotação concluída");
         bus.emit(DashboardEvent::symbol_universe(kind.dashboard_kind, active.len(), top_ranked(&active, &scores, 12)));
         if tx.send(active).is_err() {
