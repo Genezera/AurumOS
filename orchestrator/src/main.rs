@@ -1,5 +1,6 @@
 mod dashboard;
 mod events;
+mod exchange_filters;
 mod fusion;
 mod orchestrator;
 mod raw_log;

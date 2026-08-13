@@ -228,6 +228,7 @@ async fn handle_message(text: &str, tx: &Sender<Opportunity>, whale_board: &Whal
         max_loss_pct: 0.01,
         leverage: 1.0,
         correlation_group: "whale_signal".to_string(),
+        sampled_return: None,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;

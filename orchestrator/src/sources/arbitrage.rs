@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use serde_json::Value;
 use tokio::sync::{mpsc::Sender, watch, RwLock};
 use tokio::time::sleep;
@@ -22,21 +23,37 @@ const RAW_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 const BYBIT_WS_URL: &str = "wss://stream.bybit.com/v5/public/spot";
 const BITGET_WS_URL: &str = "wss://ws.bitget.com/v2/ws/public";
 
-// Estimativa de taxa taker por perna. Contas com desconto (VIP, token de
-// taxa) pagam menos — ajuste aqui se for o seu caso, senão o motor de risco
-// vai subestimar o lucro líquido real. Cada captura de spread aqui é
-// modelada como UMA perna vendida na exchange mais cara + UMA perna comprada
-// na mais barata (você já mantém saldo pré-financiado nas duas, como
+// Taxa taker por perna. Contas com desconto (VIP, token de taxa) pagam
+// menos — ajuste aqui se for o seu caso, senão o motor de risco vai
+// subestimar o lucro líquido real. Cada captura de spread aqui é modelada
+// como UMA perna vendida na exchange mais cara + UMA perna comprada na
+// mais barata (você já mantém saldo pré-financiado nas duas, como
 // planejado: US$100 em cada) — não há transferência entre exchanges por
 // operação, então não há taxa de rede/saque neste cálculo.
+//
+// Bybit: 0,10% é a taxa padrão publicada de conta não-VIP (não exposta na
+// API pública — precisaria de autenticação — mantido como o valor de
+// referência oficial da exchange). Bitget: 0,20%, verificado ao vivo
+// consultando a própria API pública (13/08/2026, pedido do usuário: "o que
+// falta pra ser 100% real?") — `GET /api/v2/spot/public/symbols` retorna
+// `takerFeeRate: "0.002"` pra BTCUSDT, o dobro do que este código assumia
+// antes (0,10%). Corrigido — o breakeven real da arbitragem é mais alto do
+// que o modelo achava.
 const BYBIT_TAKER_FEE: f64 = 0.001;
-const BITGET_TAKER_FEE: f64 = 0.001;
+const BITGET_TAKER_FEE: f64 = 0.002;
 const ROUND_TRIP_FEE: f64 = BYBIT_TAKER_FEE + BITGET_TAKER_FEE;
 const MIN_NET_EDGE: f64 = 0.0065;
 // Não reemitir a mesma direção/símbolo com mais frequência que isso — o book
 // atualiza a cada poucos milissegundos, mas o orquestrador não precisa (nem
 // quer) reavaliar a mesma oportunidade centenas de vezes por segundo.
 const EMIT_COOLDOWN: Duration = Duration::from_millis(700);
+// Achado ao vivo (13/08/2026): sem isso, um símbolo cujo book parou de
+// atualizar numa das exchanges (baixa liquidez, assinatura silenciosamente
+// falha) fica com um "spread" congelado que parece uma vantagem real e
+// persistente, mas não é executável — não há ninguém do outro lado do
+// preço parado. Pares líquidos atualizam bem mais rápido que isso; 30s já
+// é uma folga generosa antes de considerar morto.
+const BOOK_STALENESS_LIMIT: Duration = Duration::from_secs(30);
 
 // Camada de confirmação por preço (achado ao vivo, 13/08/2026, pedido do
 // usuário: "eu realmente não quero nada falso... tudo completamente próximo
@@ -58,11 +75,26 @@ struct TopOfBook {
     bid_qty: f64,
     ask: f64,
     ask_qty: f64,
+    /// Achado ao vivo (13/08/2026): KUBUSDT ficou com o MESMO bid/ask exato
+    /// da Bitget por 8+ minutos seguidos (161 confirmações, 100% "acerto")
+    /// enquanto a Bybit continuava atualizando normalmente — o book da
+    /// Bitget parou de atualizar de verdade (símbolo sem liquidez real
+    /// agora, ou falha silenciosa na assinatura), e o sistema tratava o
+    /// preço congelado como se fosse um spread real e capturável. `None`
+    /// = nunca recebeu nenhuma atualização ainda.
+    last_update: Option<Instant>,
 }
 
 impl TopOfBook {
     fn is_valid(&self) -> bool {
         self.bid > 0.0 && self.ask > 0.0 && self.ask > self.bid
+    }
+
+    /// Book "vivo" exige atualização recente dos DOIS lados — um preço que
+    /// não muda há muito tempo não é mais uma cotação real e executável,
+    /// é só o último valor visto antes do feed morrer ou secar.
+    fn is_fresh(&self, max_age: Duration) -> bool {
+        self.last_update.map(|t| t.elapsed() <= max_age).unwrap_or(false)
     }
 }
 
@@ -81,6 +113,38 @@ struct ConfirmationState {
 }
 
 type SharedConfirmation = Arc<Mutex<ConfirmationState>>;
+
+fn confirmation_history_path() -> String {
+    format!("{}/data/confirmation_history_arbitrage.json", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn load_confirmation_history() -> VecDeque<f64> {
+    let path = confirmation_history_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        tracing::info!(path, "arbitragem: nenhum histórico de confirmação salvo, começando do zero");
+        return VecDeque::new();
+    };
+    match serde_json::from_str::<Vec<f64>>(&raw) {
+        Ok(v) => {
+            tracing::info!(amostras = v.len(), "arbitragem: histórico de confirmação real recuperado do disco");
+            v.into()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "arbitragem: histórico de confirmação salvo corrompido, começando do zero");
+            VecDeque::new()
+        }
+    }
+}
+
+fn save_confirmation_history(history: &VecDeque<f64>) {
+    let path = confirmation_history_path();
+    let items: Vec<f64> = history.iter().copied().collect();
+    let Ok(json) = serde_json::to_string(&items) else { return };
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, json);
+}
 
 /// Calcula (net_edge, confidence) a partir do histórico real de confirmações
 /// — recomputado contra o book de verdade `CONFIRMATION_WINDOW` depois do
@@ -127,7 +191,13 @@ impl SignalSource for ArbitrageSource {
         // Fora do loop de propósito (mesmo raciocínio do Pump
         // Exhaustion/Order Flow): sobrevive à rotação de universo (a cada
         // 15min) e a reconexões — só ele que torna net_edge real possível.
-        let confirmation: SharedConfirmation = Arc::new(Mutex::new(ConfirmationState::default()));
+        // Persistido em disco (auditoria externa, 13/08/2026: "refilar
+        // rápido não é aceitável") — carrega no boot, salva
+        // periodicamente dentro de `run_comparator`.
+        let confirmation: SharedConfirmation = Arc::new(Mutex::new(ConfirmationState {
+            history: load_confirmation_history(),
+            pending: Vec::new(),
+        }));
 
         loop {
             let symbols = self.symbols_rx.borrow().clone();
@@ -254,6 +324,7 @@ async fn handle_bybit_message(text: &str, books: &BookMap) {
         entry.ask = ask.0;
         entry.ask_qty = ask.1;
     }
+    entry.last_update = Some(Instant::now());
 }
 
 // ---------------- Bitget ----------------
@@ -339,6 +410,7 @@ async fn handle_bitget_message(text: &str, books: &BookMap) {
         entry.ask = ask.0;
         entry.ask_qty = ask.1;
     }
+    entry.last_update = Some(Instant::now());
 }
 
 // ---------------- comparador ----------------
@@ -358,6 +430,8 @@ async fn run_comparator(
     let mut last_diag = Instant::now() - Duration::from_secs(60);
     let mut last_heartbeat = Instant::now() - HEARTBEAT_INTERVAL;
     let mut last_raw_snapshot = Instant::now() - RAW_SNAPSHOT_INTERVAL;
+    let mut last_confirmation_save = Instant::now();
+    const CONFIRMATION_SAVE_INTERVAL: Duration = Duration::from_secs(30);
     let raw_log_path = format!("{}/data/raw_arbitrage.jsonl", env!("CARGO_MANIFEST_DIR"));
     let mut best_this_window: Option<(String, f64)> = None;
     loop {
@@ -365,6 +439,11 @@ async fn run_comparator(
         let raw_snapshot_now = last_raw_snapshot.elapsed() >= RAW_SNAPSHOT_INTERVAL;
         if raw_snapshot_now {
             last_raw_snapshot = Instant::now();
+        }
+        if last_confirmation_save.elapsed() >= CONFIRMATION_SAVE_INTERVAL {
+            last_confirmation_save = Instant::now();
+            let history_snapshot = confirmation.lock().unwrap().history.clone();
+            save_confirmation_history(&history_snapshot);
         }
         let diag_now = last_diag.elapsed() >= Duration::from_secs(10);
         if diag_now {
@@ -420,6 +499,20 @@ async fn run_comparator(
             if !bb.is_valid() || !bg.is_valid() {
                 if diag_now {
                     tracing::debug!(symbol, ?bb, ?bg, "book recebido mas inválido (bid/ask zerado ou invertido)");
+                }
+                continue;
+            }
+            if !bb.is_fresh(BOOK_STALENESS_LIMIT) || !bg.is_fresh(BOOK_STALENESS_LIMIT) {
+                // Achado ao vivo (13/08/2026): KUBUSDT ficou com o preço da
+                // Bitget congelado por 8+ minutos (161 "confirmações",
+                // 100% de acerto, sempre o mesmo edge exato) enquanto a
+                // Bybit continuava atualizando — o feed tinha morrido, não
+                // era uma vantagem real e persistente. Um preço que não
+                // atualiza há mais de BOOK_STALENESS_LIMIT não é mais uma
+                // cotação executável, é o último valor visto antes do
+                // book secar ou a assinatura falhar silenciosamente.
+                if diag_now {
+                    tracing::debug!(symbol, "book desatualizado — pulando (uma das exchanges parou de atualizar)");
                 }
                 continue;
             }
@@ -503,12 +596,20 @@ async fn maybe_emit(
     // Registra a hipótese pra ser conferida contra o book real daqui a
     // CONFIRMATION_WINDOW — acontece sempre que o gate de fee é cruzado,
     // independente de já ter amostra suficiente pra confiar.
-    let (net_edge, confidence, confirmation_note) = {
+    let (net_edge, confidence, confirmation_note, sampled_return) = {
         let mut guard = confirmation.lock().unwrap();
         guard.pending.push(PendingConfirmation {
             symbol: symbol.to_string(),
             direction: direction_key,
             fired_at: Instant::now(),
+        });
+        // Reamostragem real (auditoria externa, 13/08/2026): sorteia um
+        // desfecho que REALMENTE aconteceu no histórico de confirmação,
+        // em vez de deixar o orquestrador decidir por sorteio ponderado
+        // pela média. `None` enquanto a amostra ainda for pequena demais.
+        let sampled = (guard.history.len() >= MIN_CONFIRMATION_SAMPLES).then(|| {
+            let idx = rand::thread_rng().gen_range(0..guard.history.len());
+            guard.history[idx]
         });
         match empirical_edge(&guard.history) {
             Some((edge, conf)) => {
@@ -516,12 +617,12 @@ async fn maybe_emit(
                 (edge, conf, format!(
                     "edge instantâneo {:+.3}%, confirmação real: {wins}/{} acertos, retorno médio {:+.3}%",
                     instant_edge * 100.0, guard.history.len(), edge * 100.0
-                ))
+                ), sampled)
             }
             None => (0.0, 0.3, format!(
                 "edge instantâneo {:+.3}%, aguardando confirmação ({}/{MIN_CONFIRMATION_SAMPLES} amostras)",
                 instant_edge * 100.0, guard.history.len()
-            )),
+            ), sampled),
         }
     };
 
@@ -553,7 +654,14 @@ async fn maybe_emit(
         capital_needed,
         max_loss_pct,
         leverage: 1.0,
-        correlation_group: "cross_exchange".to_string(),
+        // Achado ao vivo (13/08/2026): era "cross_exchange" fixo pra TODO
+        // símbolo — inofensivo enquanto a exposição nunca era real, mas
+        // virou deadlock de fato assim que a exposição passou a ser
+        // contabilizada de verdade (ver order_flow.rs, mesmo achado). Por
+        // símbolo, não por mecanismo — dois símbolos diferentes não são a
+        // mesma aposta de risco.
+        correlation_group: symbol.to_string(),
+        sampled_return,
         emitted_at: Instant::now(),
     };
 

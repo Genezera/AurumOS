@@ -139,6 +139,34 @@ pub struct PortfolioState {
     /// propósito, mesmo raciocínio do `recent_pnls` de `StrategyScaling`
     /// abaixo — refila rápido com o volume de trades por símbolo.
     pub symbol_scaling: HashMap<(Strategy, String), SymbolScaling>,
+    /// Achado ao vivo (13/08/2026, pedido do usuário: "o que falta pra ser
+    /// 100% real em regras/validações?"): filtros reais de lote/notional
+    /// mínimo por símbolo, buscados uma vez no boot da API pública da
+    /// própria exchange (Bybit `instruments-info`, Bitget
+    /// `spot/public/symbols`) — sem isso, uma ordem simulada podia ter
+    /// tamanho que a exchange de verdade rejeitaria. Não persiste (dado de
+    /// mercado, não capital — refaz no boot).
+    pub symbol_filters: HashMap<String, SymbolFilter>,
+    /// Limitador de taxa por venue (token bucket) — simula o rate limit
+    /// real de submissão de ordem que uma conta de varejo tem. Não
+    /// persiste (estado operacional transitório, não capital).
+    pub venue_rate_limiters: HashMap<String, RateLimiterState>,
+}
+
+/// Filtro real de um símbolo numa exchange — quantidade mínima, passo de
+/// quantidade e notional mínimo. Valores em unidades nativas (qty do
+/// ativo para `min_qty`/`qty_step`; USD para `min_notional`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SymbolFilter {
+    pub min_qty: f64,
+    pub qty_step: f64,
+    pub min_notional: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RateLimiterState {
+    tokens: f64,
+    last_refill: Instant,
 }
 
 /// PnL recente de UM símbolo dentro de UMA estratégia — a metade
@@ -265,6 +293,8 @@ impl PortfolioState {
                 .map(|&s| (s, StrategyScaling::new(cfg.initial_leg_size)))
                 .collect(),
             symbol_scaling: HashMap::new(),
+            symbol_filters: HashMap::new(),
+            venue_rate_limiters: HashMap::new(),
         }
     }
 
@@ -570,6 +600,83 @@ pub enum RejectReason {
     NoLeverageOnLaunch,
     LeverageTooHigh,
     MartingaleBlocked,
+    /// Achado ao vivo (13/08/2026): uma conta de varejo real tem limite de
+    /// requisições de ordem por segundo por exchange — nunca modelado até
+    /// aqui, o sistema tentava centenas de "ordens" por minuto sem checar
+    /// isso. Token bucket por venue (ver `strategy_venues`/
+    /// `rate_limit_available`).
+    RateLimited,
+    /// Ordem abaixo do notional/quantidade mínima REAL daquele símbolo
+    /// naquela exchange (buscado da própria API pública — `minOrderAmt` na
+    /// Bybit, `minTradeUSDT` na Bitget). Uma exchange de verdade rejeitaria
+    /// essa ordem; antes disso nada verificava.
+    BelowExchangeMinimum,
+}
+
+/// Quais exchanges (venues) uma estratégia realmente usa pra executar —
+/// usado tanto pro rate limiter quanto, no futuro, pra checar filtros por
+/// símbolo em cada uma. Estratégias que ainda não executam trade nenhum
+/// (Whale Watch, News, Macro) não aparecem aqui — não haveria pedido de
+/// ordem real pra limitar.
+fn strategy_venues(strategy: Strategy) -> &'static [&'static str] {
+    match strategy {
+        Strategy::OrderFlow => &["bybit"],
+        Strategy::Arbitrage => &["bybit", "bitget"],
+        Strategy::PumpExhaustion | Strategy::LiquidationHunter | Strategy::Launch => &["bybit"],
+        Strategy::MultiAsset => &["alpaca"],
+        Strategy::WhaleWatch | Strategy::News | Strategy::Macro => &[],
+    }
+}
+
+// Token bucket conservador — capacidade e taxa de reposição pensadas pra
+// uma conta de varejo comum (não VIP, sem acesso a endpoint dedicado).
+// Ajuste aqui se sua conta real tiver um limite documentado diferente;
+// o valor exato importa menos que o fato de EXISTIR um teto agora.
+const VENUE_RATE_LIMIT_PER_SEC: f64 = 8.0;
+const VENUE_RATE_LIMIT_BURST: f64 = 8.0;
+
+/// Só espia se haveria ficha disponível — não consome. Usado dentro do
+/// filtro de `evaluate()`, que pode ser chamado várias vezes por candidato
+/// sem que o candidato necessariamente vença e execute.
+fn rate_limit_available(portfolio: &PortfolioState, venue: &str) -> bool {
+    let tokens = match portfolio.venue_rate_limiters.get(venue) {
+        Some(s) => (s.tokens + s.last_refill.elapsed().as_secs_f64() * VENUE_RATE_LIMIT_PER_SEC).min(VENUE_RATE_LIMIT_BURST),
+        None => VENUE_RATE_LIMIT_BURST,
+    };
+    tokens >= 1.0
+}
+
+/// Consome de fato uma ficha por venue que a estratégia usa — chamado só
+/// quando uma oportunidade É REALMENTE aprovada pra abrir (não em toda
+/// avaliação especulativa do `pick_best`).
+pub fn consume_rate_limit(portfolio: &mut PortfolioState, strategy: Strategy) {
+    let now = Instant::now();
+    for &venue in strategy_venues(strategy) {
+        let state = portfolio
+            .venue_rate_limiters
+            .entry(venue.to_string())
+            .or_insert_with(|| RateLimiterState { tokens: VENUE_RATE_LIMIT_BURST, last_refill: now });
+        let refill = state.last_refill.elapsed().as_secs_f64() * VENUE_RATE_LIMIT_PER_SEC;
+        state.tokens = (state.tokens + refill).min(VENUE_RATE_LIMIT_BURST);
+        state.last_refill = now;
+        state.tokens = (state.tokens - 1.0).max(0.0);
+    }
+}
+
+/// Abre a exposição de uma posição aprovada — chamado no momento em que a
+/// ordem É REALMENTE aceita, liberado só quando a posição resolve
+/// (`record_trade_result`). Entre esses dois momentos (a duração real de
+/// `expected_holding_secs`), a exposição fica genuinamente contabilizada —
+/// achado ao vivo (13/08/2026): antes, `exposure_by_strategy`/
+/// `exposure_by_group` nunca recebiam valor diferente de zero em lugar
+/// nenhum (só resetavam pra 0.0 depois de cada trade), porque toda posição
+/// resolvia no mesmo instante em que abria. Os gates de limite de risco
+/// por estratégia/total/correlação em `evaluate()` liam exposição sempre
+/// zerada — nunca bloqueavam por excesso de exposição SIMULTÂNEA, só por
+/// um único trade grande demais sozinho.
+pub fn open_exposure(portfolio: &mut PortfolioState, opp: &Opportunity, approved: &Approved) {
+    *portfolio.exposure_by_strategy.entry(opp.strategy).or_insert(0.0) += approved.capital_at_risk;
+    *portfolio.exposure_by_group.entry(opp.correlation_group.clone()).or_insert(0.0) += approved.capital_at_risk;
 }
 
 /// Avalia uma oportunidade contra o estado atual do portfólio e os limites
@@ -665,6 +772,33 @@ pub fn evaluate(
         return Err(RejectReason::CorrelationGroupBusy);
     }
 
+    // Rate limit real por venue — uma conta de varejo não consegue
+    // submeter ordem ilimitadamente rápido. Checa TODAS as venues que a
+    // estratégia usa (arbitragem precisa das duas, já que as duas pernas
+    // são ordens reais separadas).
+    for &venue in strategy_venues(opp.strategy) {
+        if !rate_limit_available(portfolio, venue) {
+            return Err(RejectReason::RateLimited);
+        }
+    }
+
+    // Notional mínimo real por símbolo/venue (buscado da própria API
+    // pública da exchange — ver `main.rs`/`symbol_universe.rs` e
+    // `SymbolFilter`). Só valida notional (USD, comparável direto com
+    // `order_size`) — quantidade mínima/passo exigiriam o preço atual, que
+    // não chega até aqui; fica como lacuna documentada, não escondida.
+    // Se o filtro ainda não foi buscado pra esse símbolo/venue, não
+    // bloqueia (falha aberta) — melhor não travar tudo por uma busca
+    // incompleta do que fingir que validou algo que não validou.
+    for &venue in strategy_venues(opp.strategy) {
+        let key = format!("{venue}:{}", opp.base_symbol());
+        if let Some(filter) = portfolio.symbol_filters.get(&key) {
+            if filter.min_notional > 0.0 && order_size < filter.min_notional {
+                return Err(RejectReason::BelowExchangeMinimum);
+            }
+        }
+    }
+
     Ok(Approved {
         order_size,
         capital_at_risk,
@@ -724,15 +858,20 @@ pub fn record_trade_result(
         portfolio.losses += 1;
     }
 
-    // Posições neste modelo de paper trading são "round-trip" imediatas
-    // (o módulo real manteria a posição aberta até o fechamento real);
-    // aqui liberamos a exposição assim que o resultado é conhecido.
-    portfolio
-        .exposure_by_strategy
-        .insert(opp.strategy, 0.0);
-    portfolio
-        .exposure_by_group
-        .insert(opp.correlation_group.clone(), 0.0);
+    // Achado ao vivo (13/08/2026): posições agora ficam genuinamente
+    // abertas entre `open_exposure` (no momento da aprovação) e aqui (no
+    // momento em que a janela real de `expected_holding_secs` termina —
+    // ver `orchestrator.rs`). Por isso SUBTRAI só o que esta posição
+    // específica contribuiu, nunca zera o mapa inteiro — outras posições
+    // da mesma estratégia/grupo podem estar abertas ao mesmo tempo. O
+    // `.max(0.0)` é só uma trava contra deriva de ponto flutuante, não
+    // uma correção de lógica esperada.
+    if let Some(e) = portfolio.exposure_by_strategy.get_mut(&opp.strategy) {
+        *e = (*e - approved.capital_at_risk).max(0.0);
+    }
+    if let Some(e) = portfolio.exposure_by_group.get_mut(&opp.correlation_group) {
+        *e = (*e - approved.capital_at_risk).max(0.0);
+    }
 
     portfolio
         .last_outcome_by_strategy

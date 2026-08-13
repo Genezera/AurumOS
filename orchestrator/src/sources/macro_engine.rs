@@ -113,6 +113,7 @@ impl SignalSource for MacroEngineSource {
                         max_loss_pct: 0.02,
                         leverage: 1.0,
                         correlation_group: "usd_macro".to_string(),
+                        sampled_return: None,
                         emitted_at: Instant::now(),
                     };
                     let _ = tx.send(opp).await;

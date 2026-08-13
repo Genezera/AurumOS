@@ -107,6 +107,17 @@ pub struct Opportunity {
     /// risco (ex.: "altcoins", "nasdaq_tech", "usd_macro") para impedir que o
     /// orquestrador acumule exposição correlacionada sem perceber.
     pub correlation_group: String,
+    /// Reamostragem real (bootstrap) de um desfecho JÁ CONFIRMADO contra
+    /// preço real, sorteado no instante da emissão a partir do histórico de
+    /// confirmação da estratégia — não uma fórmula (edge×confiança), um
+    /// desfecho que realmente aconteceu antes com um sinal parecido.
+    /// Achado ao vivo (13/08/2026, auditoria externa): o modelo anterior
+    /// decidia ganhou/perdeu por sorteio ponderado por uma probabilidade
+    /// agregada — válido (não olha o futuro DESTA operação), mas não é o
+    /// mesmo que herdar um resultado real observado. `None` = estratégia
+    /// ainda sem confirmação suficiente (ou que não usa este mecanismo) —
+    /// nesse caso o orquestrador cai no sorteio antigo.
+    pub sampled_return: Option<f64>,
     pub emitted_at: Instant,
 }
 

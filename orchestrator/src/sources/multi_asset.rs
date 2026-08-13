@@ -193,6 +193,7 @@ async fn handle_message(
             max_loss_pct: 0.01,
             leverage: 1.0,
             correlation_group: "us_equities".to_string(),
+            sampled_return: None,
             emitted_at: Instant::now(),
         };
         let _ = tx.send(opp).await;

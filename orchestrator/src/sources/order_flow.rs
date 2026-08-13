@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
@@ -31,7 +32,14 @@ struct SpreadSnapshot {
 // Aqui a aposta é diferente: cotar como MAKER (adiciona liquidez em vez de
 // consumir) paga uma taxa menor, então o próprio spread interno do book já
 // pode compensar.
-const MAKER_FEE: f64 = 0.0008;
+//
+// Corrigido (13/08/2026, auditoria externa): estava 0,08%, assumindo
+// desconto de conta (VIP/token de taxa) sem confirmar que a conta real
+// teria isso. A taxa maker publicada padrão (não-VIP) da Bybit é 0,10% —
+// não exposta na API pública de mercado (precisaria de autenticação, como
+// a da Bitget não precisa), então uso o valor conservador/publicado até
+// haver como confirmar um desconto real.
+const MAKER_FEE: f64 = 0.001;
 const MIN_NET_EDGE: f64 = 0.0045;
 const EMIT_COOLDOWN: Duration = Duration::from_millis(700);
 
@@ -63,6 +71,38 @@ struct PendingConfirmation {
     fired_at: Instant,
 }
 
+fn confirmation_history_path() -> String {
+    format!("{}/data/confirmation_history_order_flow.json", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn load_confirmation_history() -> VecDeque<f64> {
+    let path = confirmation_history_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        tracing::info!(path, "order flow: nenhum histórico de confirmação salvo, começando do zero");
+        return VecDeque::new();
+    };
+    match serde_json::from_str::<Vec<f64>>(&raw) {
+        Ok(v) => {
+            tracing::info!(amostras = v.len(), "order flow: histórico de confirmação real recuperado do disco");
+            v.into()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "order flow: histórico de confirmação salvo corrompido, começando do zero");
+            VecDeque::new()
+        }
+    }
+}
+
+fn save_confirmation_history(history: &VecDeque<f64>) {
+    let path = confirmation_history_path();
+    let items: Vec<f64> = history.iter().copied().collect();
+    let Ok(json) = serde_json::to_string(&items) else { return };
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, json);
+}
+
 pub struct OrderFlowSource {
     pub symbols_rx: watch::Receiver<Vec<String>>,
     pub bus: EventBus,
@@ -86,7 +126,15 @@ impl SignalSource for OrderFlowSource {
         // Exhaustion): uma queda de conexão ou rotação de universo (a cada
         // 15min) não pode apagar o histórico de confirmação acumulado — só
         // ele que torna net_edge real possível.
-        let mut confirmation_history: VecDeque<f64> = VecDeque::new();
+        //
+        // Persistido em disco (auditoria externa, 13/08/2026: "refilar
+        // rápido não é aceitável — pode ser exatamente o problema de
+        // contar várias observações correlacionadas [se refizer do zero a
+        // cada restart, no início da janela as poucas amostras que
+        // existem tendem a vir do mesmo movimento de mercado]"). Mesmo
+        // padrão já usado pra edge_scores: carrega no boot, salva
+        // periodicamente.
+        let mut confirmation_history: VecDeque<f64> = load_confirmation_history();
         let mut pending_confirmations: Vec<PendingConfirmation> = Vec::new();
         loop {
             let symbols = self.symbols_rx.borrow().clone();
@@ -138,6 +186,7 @@ async fn run_once(
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut raw_snapshot = tokio::time::interval(RAW_SNAPSHOT_INTERVAL);
     let mut confirmation_check = tokio::time::interval(CONFIRMATION_CHECK_INTERVAL);
+    let mut confirmation_save = tokio::time::interval(Duration::from_secs(30));
     let raw_log_path = format!("{}/data/raw_order_flow.jsonl", env!("CARGO_MANIFEST_DIR"));
     let mut last_msg = Instant::now();
     const READ_TIMEOUT: Duration = Duration::from_secs(25);
@@ -167,6 +216,9 @@ async fn run_once(
                         "net_edge": s.net_edge,
                     }));
                 }
+            }
+            _ = confirmation_save.tick() => {
+                save_confirmation_history(confirmation_history);
             }
             _ = confirmation_check.tick() => {
                 // Passou a janela de confirmação — confere o preço real
@@ -308,6 +360,17 @@ async fn handle_message(
         )),
     };
 
+    // Reamostragem real (auditoria externa, 13/08/2026): em vez de deixar
+    // o orquestrador decidir ganhou/perdeu por sorteio ponderado pela
+    // média (`confidence`/`net_edge` acima), sorteia AQUI um desfecho que
+    // REALMENTE aconteceu — um valor real do histórico de confirmação,
+    // não uma fórmula. `None` (estratégia sem amostra suficiente ainda)
+    // faz o orquestrador cair no sorteio antigo por confidence/net_edge.
+    let sampled_return = (confirmation_history.len() >= MIN_CONFIRMATION_SAMPLES).then(|| {
+        let idx = rand::thread_rng().gen_range(0..confirmation_history.len());
+        confirmation_history[idx]
+    });
+
     let notional = bid.1.min(ask.1) * mid;
     let capital_needed = notional.min(40.0).max(5.0);
 
@@ -327,7 +390,19 @@ async fn handle_message(
         capital_needed,
         max_loss_pct: 0.003,
         leverage: 1.0,
-        correlation_group: "cross_exchange".to_string(),
+        // Achado ao vivo (13/08/2026): era "cross_exchange" fixo pra TODO
+        // símbolo — inofensivo enquanto a exposição nunca era real (não
+        // bloqueava nada), mas virou um deadlock de fato assim que
+        // `open_exposure`/`resolve_position` passaram a contabilizar
+        // exposição de verdade: a primeira posição aberta de qualquer
+        // símbolo bloqueava TODAS as outras até fechar, porque todas
+        // "competiam" pelo mesmo grupo. O próprio comentário do campo em
+        // types.rs já dizia a intenção certa: agrupar por MESMA APOSTA de
+        // risco — dois símbolos diferentes não são a mesma aposta; o mesmo
+        // símbolo via dois sinais diferentes, sim. Por símbolo, não por
+        // mecanismo.
+        correlation_group: symbol.to_string(),
+        sampled_return,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;

@@ -189,6 +189,7 @@ async fn handle_message(text: &str, client: &reqwest::Client, tx: &Sender<Opport
         max_loss_pct: 0.02,
         leverage: 1.0,
         correlation_group: "new_listings".to_string(),
+        sampled_return: None,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;

@@ -105,6 +105,7 @@ async fn emit(tx: &Sender<Opportunity>, symbol: &str) {
         // confiáveis logo na abertura (mesma regra do risk.toml).
         leverage: 1.0,
         correlation_group: "new_listings".to_string(),
+        sampled_return: None,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;

@@ -57,6 +57,21 @@ const SECOND_LEG_FAILURE_PROB: f64 = 0.03;
 /// negócio.
 const MAX_TRADES_PER_TICK: usize = 50;
 
+/// Uma posição aprovada, ainda não resolvida — vive entre `open_position`
+/// (aprovação real, exposição contabilizada) e `resolve_position` (fim da
+/// janela real de `expected_holding_secs`, resultado simulado, exposição
+/// liberada). Achado ao vivo (13/08/2026, pergunta do usuário: "o que
+/// falta pra ser 100% real?"): antes, essas duas coisas aconteciam no
+/// mesmo instante — nenhuma posição jamais ficava genuinamente "aberta",
+/// então `exposure_by_strategy`/`exposure_by_group` nunca acumulavam nada
+/// pra valer, e os gates de limite de risco simultâneo em `risk::evaluate`
+/// nunca tinham o que checar de verdade.
+struct OpenPosition {
+    opp: Opportunity,
+    approved: risk::Approved,
+    resolves_at: Instant,
+}
+
 /// Roda o loop central: acumula oportunidades chegando dos módulos, a cada
 /// tick escolhe a melhor entre as ainda válidas e aprovadas pelo risk
 /// engine, simula o resultado (paper trading) e atualiza o portfólio.
@@ -78,6 +93,20 @@ pub async fn run(
     // pro equity inicial, o que destruiria qualquer continuidade real do
     // paper trading.
     let mut portfolio = PortfolioState::load_or_new(&cfg, &state_path);
+
+    // Filtros reais de lote/notional mínimo por símbolo — buscados uma vez
+    // no boot (mudam raramente durante uma sessão). Falha de rede aqui não
+    // é fatal: `risk::evaluate` simplesmente não valida notional mínimo
+    // pros símbolos sem entrada no mapa (falha aberta — melhor não travar
+    // tudo por uma busca incompleta do que fingir que validou algo que não
+    // validou; ver `exchange_filters.rs`).
+    for (symbol, filter) in crate::exchange_filters::fetch_bybit_spot_filters().await {
+        portfolio.symbol_filters.insert(format!("bybit:{symbol}"), filter);
+    }
+    for (symbol, filter) in crate::exchange_filters::fetch_bitget_spot_filters().await {
+        portfolio.symbol_filters.insert(format!("bitget:{symbol}"), filter);
+    }
+
     // Sem isso, os tiles do dashboard ficam em "—" pra sempre até a
     // primeira operação executar — o que pode nunca acontecer se nenhuma
     // oportunidade tiver edge positivo. O estado inicial (equity de boot,
@@ -86,6 +115,7 @@ pub async fn run(
     bus.emit(DashboardEvent::portfolio_snapshot(&portfolio));
 
     let mut pending: Vec<Opportunity> = Vec::new();
+    let mut open_positions: Vec<OpenPosition> = Vec::new();
     let mut rng = rand::thread_rng();
     let mut confluence_cooldown: HashMap<String, Instant> = HashMap::new();
     let mut was_halted = false;
@@ -109,6 +139,30 @@ pub async fn run(
             }
             _ = tick.tick() => {
                 pending.retain(|o| !o.is_expired());
+
+                // Resolve posições cuja janela real de holding já terminou
+                // ANTES de abrir novas — a exposição que elas liberam fica
+                // disponível pra próxima decisão já neste mesmo tick, em
+                // vez de artificialmente indisponível até o próximo.
+                let now = Instant::now();
+                let mut still_open = Vec::with_capacity(open_positions.len());
+                let mut hit_cycle_limit = false;
+                for pos in open_positions.drain(..) {
+                    if pos.resolves_at > now {
+                        still_open.push(pos);
+                        continue;
+                    }
+                    resolve_position(&mut portfolio, &cfg, pos, &mut rng, &bus);
+                    portfolio.save(&state_path);
+                    if portfolio.total_cycles >= max_cycles {
+                        tracing::info!(cycles = portfolio.total_cycles, "limite de ciclos atingido");
+                        hit_cycle_limit = true;
+                    }
+                }
+                open_positions = still_open;
+                if hit_cycle_limit {
+                    break;
+                }
 
                 let confluence_bonus = detect_and_emit_confluence(&pending, &bus, &mut confluence_cooldown);
 
@@ -149,31 +203,21 @@ pub async fn run(
 
                 let slots = if is_halted { 0 } else { MAX_TRADES_PER_TICK };
                 let mut done_this_tick = 0;
-                let mut hit_cycle_limit = false;
 
                 while done_this_tick < slots {
-                    // Reavalia a cada iteração: depois de executar uma
-                    // oportunidade, a exposição por estratégia/grupo mudou,
-                    // então a 2ª/3ª escolha respeita o risco já comprometido
-                    // pela 1ª — nunca é "N ordens avaliadas contra o mesmo
-                    // estado congelado".
+                    // Reavalia a cada iteração: depois de ABRIR uma posição,
+                    // a exposição por estratégia/grupo mudou de verdade
+                    // (fica contabilizada até a posição resolver, não mais
+                    // liberada no mesmo instante), então a 2ª/3ª escolha
+                    // respeita o risco já comprometido pela 1ª — nunca é "N
+                    // ordens avaliadas contra o mesmo estado congelado".
                     let Some(idx) = pick_best(&pending, &portfolio, &cfg, &confluence_bonus) else {
                         break;
                     };
                     let opp = pending.remove(idx);
-                    execute(&mut portfolio, &cfg, &opp, &mut rng, &bus);
+                    open_position(&mut portfolio, &cfg, opp, &bus, &mut open_positions);
                     portfolio.save(&state_path);
                     done_this_tick += 1;
-
-                    if portfolio.total_cycles >= max_cycles {
-                        tracing::info!(cycles = portfolio.total_cycles, "limite de ciclos atingido");
-                        hit_cycle_limit = true;
-                        break;
-                    }
-                }
-
-                if hit_cycle_limit {
-                    break;
                 }
             }
         }
@@ -274,19 +318,19 @@ fn pick_best(
 }
 
 /// Aprova formalmente a oportunidade vencedora (recalcula o `Approved` já
-/// que `pick_best` só checou viabilidade), simula um resultado ponderado
-/// pela confiança do sinal, e registra no portfólio.
-///
-/// A simulação aqui é só para exercitar a mecânica do orquestrador — não é
-/// um backtest e não deve ser lida como previsão de retorno real.
-fn execute(
+/// que `pick_best` só checou viabilidade) e ABRE a posição — diferente de
+/// antes, não resolve o resultado agora. A exposição fica genuinamente
+/// contabilizada (`risk::open_exposure`) e uma ficha do rate limiter da(s)
+/// venue(s) é consumida (`risk::consume_rate_limit`) até `resolve_position`
+/// fechar, quando a janela real de `opp.expected_holding_secs` terminar.
+fn open_position(
     portfolio: &mut PortfolioState,
     cfg: &RiskConfig,
-    opp: &Opportunity,
-    rng: &mut impl Rng,
+    opp: Opportunity,
     bus: &EventBus,
+    open_positions: &mut Vec<OpenPosition>,
 ) {
-    let approved = match risk::evaluate(opp, portfolio, cfg) {
+    let approved = match risk::evaluate(&opp, portfolio, cfg) {
         Ok(a) => a,
         Err(reason) => {
             portfolio.rejections += 1;
@@ -307,6 +351,30 @@ fn execute(
         approved.order_size,
     ));
 
+    risk::open_exposure(portfolio, &opp, &approved);
+    risk::consume_rate_limit(portfolio, opp.strategy);
+
+    let resolves_at = Instant::now() + Duration::from_secs_f64(opp.expected_holding_secs.max(0.05));
+    open_positions.push(OpenPosition { opp, approved, resolves_at });
+}
+
+/// Resolve uma posição cuja janela real de holding terminou: simula o
+/// resultado (mesma mecânica de sempre — sorteio ponderado pela confiança,
+/// que pra Order Flow/Arbitragem já vem de confirmação real de preço, não
+/// mais chutada) e libera a exposição que `open_position` reservou.
+///
+/// A simulação de resultado em si ainda é só pra exercitar a mecânica do
+/// orquestrador — não é um backtest e não deve ser lida como previsão de
+/// retorno real.
+fn resolve_position(
+    portfolio: &mut PortfolioState,
+    cfg: &RiskConfig,
+    pos: OpenPosition,
+    rng: &mut impl Rng,
+    bus: &EventBus,
+) {
+    let OpenPosition { opp, approved, .. } = pos;
+
     let leg_failed = opp.strategy == Strategy::Arbitrage && rng.gen_bool(SECOND_LEG_FAILURE_PROB);
     let fill_fraction = if rng.gen_bool(PARTIAL_FILL_PROB) {
         rng.gen_range(PARTIAL_FILL_MIN_FRACTION..1.0)
@@ -321,11 +389,26 @@ fn execute(
         (false, -(approved.order_size * opp.max_loss_pct * 2.0), "falha_segunda_perna")
     } else {
         let filled_size = approved.order_size * fill_fraction;
-        let won = rng.gen_bool(opp.confidence.clamp(0.0, 1.0));
-        let pnl = if won {
-            filled_size * opp.net_edge
-        } else {
-            -(filled_size * opp.max_loss_pct)
+        // Reamostragem real (auditoria externa, 13/08/2026): quando a
+        // fonte já anexou um desfecho REAL sorteado do próprio histórico
+        // de confirmação (`sampled_return` — Order Flow/Arbitragem, uma
+        // vez com amostra suficiente), usa ele diretamente em vez de
+        // sortear ganhou/perdeu de novo aqui por uma fórmula. O resultado
+        // deste trade passa a herdar um desfecho que realmente aconteceu
+        // com um sinal parecido, não uma combinação sintética de
+        // confidence×net_edge. Estratégias sem essa camada ainda (ou sem
+        // amostra suficiente) caem no sorteio antigo, sem mudança.
+        let (won, pnl) = match opp.sampled_return {
+            Some(realized_return) => (realized_return > 0.0, filled_size * realized_return),
+            None => {
+                let won = rng.gen_bool(opp.confidence.clamp(0.0, 1.0));
+                let pnl = if won {
+                    filled_size * opp.net_edge
+                } else {
+                    -(filled_size * opp.max_loss_pct)
+                };
+                (won, pnl)
+            }
         };
         (won, pnl, if fill_fraction < 1.0 { "fill_parcial" } else { "fill_total" })
     };
@@ -344,7 +427,7 @@ fn execute(
         "ordem simulada executada"
     );
 
-    let scale_events = risk::record_trade_result(portfolio, cfg, opp, &approved, outcome, pnl);
+    let scale_events = risk::record_trade_result(portfolio, cfg, &opp, &approved, outcome, pnl);
 
     bus.emit(DashboardEvent::trade_result(
         opp.strategy,

@@ -244,6 +244,7 @@ async fn emit(tx: &Sender<Opportunity>, client: &reqwest::Client, entry: &Entry)
         max_loss_pct: 0.01,
         leverage: 1.0,
         correlation_group: "news_driven".to_string(),
+        sampled_return: None,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;
