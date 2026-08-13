@@ -31,6 +31,12 @@ const EDGE_HISTORY_CAP: usize = 500;
 // de só 80, e explora candidatos novos numa taxa proporcionalmente maior a
 // cada rotação — sem inventar edge, só olhando mais mercado, mais rápido.
 const ROTATION_INTERVAL: Duration = Duration::from_secs(15 * 60);
+// Ranking exibido no dashboard refaz a cada 5s entre uma rotação e outra —
+// não decide quem entra/sai da lista ativa (isso continua só a cada
+// ROTATION_INTERVAL), só deixa o número visível acompanhar o edge real
+// medido tick a tick, que já está sendo gravado o tempo todo de qualquer
+// forma.
+const LIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const TOTAL_TARGET: usize = 220;
 const MIN_EXPLORATION_SLOTS: usize = 50;
 const MIN_SAMPLES_TO_TRUST: usize = 200;
@@ -196,12 +202,26 @@ pub async fn run(kind: UniverseKind, scores: EdgeScores, tx: watch::Sender<Vec<S
         save_edge_scores(&scores, kind.edge_scores_filename);
         tracing::info!(total = active.len(), categoria = kind.bybit_category, "universo de símbolos: rotação concluída");
         bus.emit(DashboardEvent::symbol_universe(kind.dashboard_kind, active.len(), top_ranked(&active, &scores, 12)));
-        if tx.send(active).is_err() {
+        if tx.send(active.clone()).is_err() {
             tracing::warn!(categoria = kind.bybit_category, "universo de símbolos: nenhum consumidor ouvindo mais, encerrando tarefa de rotação");
             return;
         }
 
-        tokio::time::sleep(ROTATION_INTERVAL).await;
+        // Pedido do usuário (12/08/2026: "não tem como fazer isso em tempo
+        // real para ver o edge de todos os ativos?"): a LISTA ATIVA só muda
+        // a cada ROTATION_INTERVAL (15min, de propósito — não queremos
+        // promover/rebaixar um símbolo por causa de um tick ruidoso
+        // isolado), mas o RANKING exibido (média/amostras de cada símbolo
+        // já ativo) pode — e deve — atualizar muito mais rápido, já que
+        // `record_edge` já grava cada tick real assim que chega. Reemite o
+        // mesmo ranking a cada LIVE_REFRESH_INTERVAL até a próxima rotação
+        // de verdade, sem mexer em quem está ou não na lista.
+        let mut waited = Duration::ZERO;
+        while waited < ROTATION_INTERVAL {
+            tokio::time::sleep(LIVE_REFRESH_INTERVAL).await;
+            waited += LIVE_REFRESH_INTERVAL;
+            bus.emit(DashboardEvent::symbol_universe(kind.dashboard_kind, active.len(), top_ranked(&active, &scores, 12)));
+        }
     }
 }
 
