@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
@@ -103,6 +104,20 @@ const CONFIRMATION_WINDOW: Duration = Duration::from_secs(20 * 60);
 const MIN_CONFIRMATION_SAMPLES: usize = 20;
 const CONFIRMATION_HISTORY_CAP: usize = 500;
 const CONFIRMATION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+// Achado ao vivo (13/08/2026, pedido do usuário: "confirme que está tudo
+// rodando realmente real, nada de coisa falsa"): `empirical_edge` calculava
+// o retorno médio direto da variação de preço observada, sem descontar
+// NENHUMA taxa de execução — diferente de Order Flow (MAKER_FEE) e
+// Arbitragem (ROUND_TRIP_FEE), que já descontam. Isso inflava o net_edge
+// medido pelo custo real de abrir/fechar uma posição short em perpétuo.
+// Taxa taker publicada padrão (não-VIP) da Bybit USDT-perpétuo é 0,055%
+// por lado — não exposta na API pública de mercado (precisaria de
+// autenticação, como o maker da Bybit spot), então uso o valor
+// conservador/publicado, mesmo racional já aplicado ao MAKER_FEE de
+// order_flow.rs. Entrada e saída são ambas taker (reação rápida a um
+// sinal de exaustão já detectado, não uma cotação passiva).
+const ROUND_TRIP_TAKER_FEE: f64 = 2.0 * 0.00055;
 
 #[derive(Debug, Clone, Default, Copy)]
 struct TickerState {
@@ -328,7 +343,12 @@ fn empirical_edge(history: &VecDeque<f64>) -> Option<(f64, f64)> {
     if history.len() < MIN_CONFIRMATION_SAMPLES {
         return None;
     }
-    let avg_return = history.iter().map(|m| -m).sum::<f64>() / history.len() as f64;
+    let avg_return = history.iter().map(|m| -m - ROUND_TRIP_TAKER_FEE).sum::<f64>() / history.len() as f64;
+    // Acerto continua definido pelo movimento bruto de preço (a taxa não
+    // muda a DIREÇÃO do resultado, só o tamanho) — não usar `net_of_fee <
+    // 0.0` aqui faria um trade que teria empatado sem taxa contar como
+    // derrota só por causa da taxa, o que é verdade pro PnL mas não é
+    // "acerto direcional", que é o que este número representa.
     let win_rate = history.iter().filter(|&&m| m < 0.0).count() as f64 / history.len() as f64;
     // Nunca emite edge negativo — se o histórico mostra que o padrão não
     // funciona, o módulo simplesmente continua informativo (net_edge=0),
@@ -462,6 +482,18 @@ async fn handle_message(
         }
         None => (0.0, 0.3, format!("aguardando confirmação ({}/{MIN_CONFIRMATION_SAMPLES} amostras)", confirmation_history.len())),
     };
+
+    // Reamostragem real (achado ao vivo, 13/08/2026: este módulo já tinha
+    // confirmation_history com desfechos reais, igual Order Flow/
+    // Arbitragem, mas nunca sorteava dele — todo trade de Pump Exhaustion
+    // ainda caía no sorteio antigo por confidence). Mesmo padrão: sorteia
+    // um desfecho que REALMENTE aconteceu, convertido pra retorno de uma
+    // posição short líquido de taxa (`-movimento - taxa`), em vez de
+    // deixar o orquestrador decidir por sorteio ponderado.
+    let sampled_return = (confirmation_history.len() >= MIN_CONFIRMATION_SAMPLES).then(|| {
+        let idx = rand::thread_rng().gen_range(0..confirmation_history.len());
+        -confirmation_history[idx] - ROUND_TRIP_TAKER_FEE
+    });
     // Reforço de fusão na confiança (nunca no net_edge — esse continua vindo
     // só da confirmação de preço medida, não de um sinal de outro módulo).
     // +15% por reforço confirmado, até +30% com os dois — nunca acima de
@@ -511,7 +543,7 @@ async fn handle_message(
         max_loss_pct: 0.02,
         leverage: 1.0,
         correlation_group: "altcoins".to_string(),
-        sampled_return: None,
+        sampled_return,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;
