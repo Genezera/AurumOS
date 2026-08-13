@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -30,19 +30,38 @@ struct SpreadSnapshot {
 // nesses pares é quase zero — não sobra nada depois de duas taxas taker.
 // Aqui a aposta é diferente: cotar como MAKER (adiciona liquidez em vez de
 // consumir) paga uma taxa menor, então o próprio spread interno do book já
-// pode compensar. Isso não modela fila de execução real (quem chega
-// primeiro no preço, risco de seleção adversa) — é uma aproximação inicial
-// que assume as duas pontas preenchem; por isso a confiança fica baixa.
+// pode compensar.
 const MAKER_FEE: f64 = 0.0008;
-// Achado da análise de breakeven (backtests/edge_threshold_analysis.py,
-// 12/08/2026): confidence aqui é FIXA em 0.45 (abaixo de 50% de propósito,
-// por ser uma aproximação que ignora fila de execução real) — isso implica
-// breakeven em ~0,367% de edge líquido (confidence*edge = (1-confidence)*max_loss_pct).
-// Qualquer operação abaixo disso já é -EV pelo próprio modelo, o que bate
-// com o achado real (43% de acerto, prejuízo líquido acumulado). Antigo
-// limiar de 0,04% deixava passar isso o tempo todo.
 const MIN_NET_EDGE: f64 = 0.0045;
 const EMIT_COOLDOWN: Duration = Duration::from_millis(700);
+
+// Camada de confirmação por preço (achado ao vivo, 13/08/2026, pedido do
+// usuário: "eu realmente não quero nada falso... taxas, movimentações,
+// operações, tudo completamente próximo ou replicado da realidade"):
+// substitui o `confidence=0.45` fixo (chute nunca validado) pelo mesmo
+// mecanismo já provado no Pump Exhaustion — registra o preço no instante do
+// sinal, espera uma janela real, e só confia no edge/confiança depois de
+// confirmar contra o preço real subsequente. Antes de ter amostra
+// suficiente, a estratégia fica informativa (net_edge=0.0), igual a
+// Whale Watch/News/Macro hoje — nenhum trade sintético é contado como
+// lucro.
+//
+// Janela curta (30s, ~expected_holding_secs) porque Order Flow é uma
+// cotação passiva de segundos, não uma aposta de minutos como Pump
+// Exhaustion. MIN_CONFIRMATION_SAMPLES mais alto (50, não 20) porque o
+// volume de sinais é muito maior — dá pra exigir mais rigor estatístico
+// sem esperar muito tempo real.
+const CONFIRMATION_WINDOW: Duration = Duration::from_secs(30);
+const MIN_CONFIRMATION_SAMPLES: usize = 50;
+const CONFIRMATION_HISTORY_CAP: usize = 1000;
+const CONFIRMATION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+struct PendingConfirmation {
+    symbol: String,
+    entry_mid: f64,
+    entry_edge: f64,
+    fired_at: Instant,
+}
 
 pub struct OrderFlowSource {
     pub symbols_rx: watch::Receiver<Vec<String>>,
@@ -63,10 +82,16 @@ impl SignalSource for OrderFlowSource {
     }
 
     async fn run(&mut self, tx: Sender<Opportunity>) -> anyhow::Result<()> {
+        // Vivem fora de run_once de propósito (mesmo raciocínio do Pump
+        // Exhaustion): uma queda de conexão ou rotação de universo (a cada
+        // 15min) não pode apagar o histórico de confirmação acumulado — só
+        // ele que torna net_edge real possível.
+        let mut confirmation_history: VecDeque<f64> = VecDeque::new();
+        let mut pending_confirmations: Vec<PendingConfirmation> = Vec::new();
         loop {
             let symbols = self.symbols_rx.borrow().clone();
             tokio::select! {
-                result = run_once(&symbols, &tx, &self.bus, &self.edge_scores) => {
+                result = run_once(&symbols, &tx, &self.bus, &self.edge_scores, &mut confirmation_history, &mut pending_confirmations) => {
                     if let Err(e) = result {
                         tracing::warn!(error = %e, "conexão de order flow (Bybit) caiu, reconectando em 3s");
                     }
@@ -80,7 +105,15 @@ impl SignalSource for OrderFlowSource {
     }
 }
 
-async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus, edge_scores: &EdgeScores) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn run_once(
+    symbols: &[String],
+    tx: &Sender<Opportunity>,
+    bus: &EventBus,
+    edge_scores: &EdgeScores,
+    confirmation_history: &mut VecDeque<f64>,
+    pending_confirmations: &mut Vec<PendingConfirmation>,
+) -> anyhow::Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(BYBIT_WS_URL).await?;
     let (mut sink, mut stream) = ws.split();
 
@@ -104,6 +137,7 @@ async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus, 
     let mut watchdog = tokio::time::interval(Duration::from_secs(5));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut raw_snapshot = tokio::time::interval(RAW_SNAPSHOT_INTERVAL);
+    let mut confirmation_check = tokio::time::interval(CONFIRMATION_CHECK_INTERVAL);
     let raw_log_path = format!("{}/data/raw_order_flow.jsonl", env!("CARGO_MANIFEST_DIR"));
     let mut last_msg = Instant::now();
     const READ_TIMEOUT: Duration = Duration::from_secs(25);
@@ -134,10 +168,37 @@ async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus, 
                     }));
                 }
             }
+            _ = confirmation_check.tick() => {
+                // Passou a janela de confirmação — confere o preço real
+                // AGORA contra o preço no instante do sinal. Se o mercado
+                // andou mais que o próprio edge esperado, o edge foi
+                // corroído (ou invertido) por movimento real — não por
+                // sorteio.
+                let now = Instant::now();
+                let mut still_pending = Vec::with_capacity(pending_confirmations.len());
+                for p in pending_confirmations.drain(..) {
+                    if now.duration_since(p.fired_at) < CONFIRMATION_WINDOW {
+                        still_pending.push(p);
+                        continue;
+                    }
+                    if let Some(s) = snapshots.get(&p.symbol) {
+                        let current_mid = (s.bid + s.ask) / 2.0;
+                        if p.entry_mid > 0.0 && current_mid > 0.0 {
+                            let pct_move_abs = ((current_mid - p.entry_mid) / p.entry_mid).abs();
+                            let realized_return = p.entry_edge - pct_move_abs;
+                            confirmation_history.push_back(realized_return);
+                            while confirmation_history.len() > CONFIRMATION_HISTORY_CAP {
+                                confirmation_history.pop_front();
+                            }
+                        }
+                    }
+                }
+                *pending_confirmations = still_pending;
+            }
             msg = stream.next() => {
                 last_msg = Instant::now();
                 match msg {
-                    Some(Ok(WsMessage::Text(text))) => handle_message(&text, tx, &mut last_emitted, &mut last_diag, &mut best_seen, &mut snapshots, edge_scores).await,
+                    Some(Ok(WsMessage::Text(text))) => handle_message(&text, tx, &mut last_emitted, &mut last_diag, &mut best_seen, &mut snapshots, edge_scores, pending_confirmations, confirmation_history).await,
                     Some(Ok(WsMessage::Ping(p))) => { sink.send(WsMessage::Pong(p)).await?; }
                     Some(Ok(WsMessage::Close(_))) | None => {
                         anyhow::bail!("conexão fechada pelo servidor");
@@ -150,6 +211,20 @@ async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus, 
     }
 }
 
+/// Calcula (net_edge, confidence) a partir do histórico real de confirmações
+/// — retorno médio e taxa de acerto, ambos medidos contra o preço real
+/// subsequente, nunca escolhidos a dedo. `None` enquanto a amostra for
+/// pequena demais pra significar algo (mesmo padrão do Pump Exhaustion).
+fn empirical_edge(history: &VecDeque<f64>) -> Option<(f64, f64)> {
+    if history.len() < MIN_CONFIRMATION_SAMPLES {
+        return None;
+    }
+    let avg_return = history.iter().sum::<f64>() / history.len() as f64;
+    let win_rate = history.iter().filter(|&&r| r > 0.0).count() as f64 / history.len() as f64;
+    Some((avg_return.max(0.0), win_rate.clamp(0.1, 0.9)))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_message(
     text: &str,
     tx: &Sender<Opportunity>,
@@ -158,6 +233,8 @@ async fn handle_message(
     best_seen: &mut HashMap<String, f64>,
     snapshots: &mut HashMap<String, SpreadSnapshot>,
     edge_scores: &EdgeScores,
+    pending_confirmations: &mut Vec<PendingConfirmation>,
+    confirmation_history: &VecDeque<f64>,
 ) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -181,10 +258,10 @@ async fn handle_message(
 
     let mid = (bid.0 + ask.0) / 2.0;
     let spread_pct = (ask.0 - bid.0) / mid;
-    let net_edge = spread_pct - 2.0 * MAKER_FEE;
-    best_seen.insert(symbol.to_string(), net_edge);
-    snapshots.insert(symbol.to_string(), SpreadSnapshot { bid: bid.0, ask: ask.0, net_edge });
-    record_edge(edge_scores, symbol, net_edge);
+    let instant_edge = spread_pct - 2.0 * MAKER_FEE;
+    best_seen.insert(symbol.to_string(), instant_edge);
+    snapshots.insert(symbol.to_string(), SpreadSnapshot { bid: bid.0, ask: ask.0, net_edge: instant_edge });
+    record_edge(edge_scores, symbol, instant_edge);
 
     let should_diag = last_diag
         .get(symbol)
@@ -192,10 +269,10 @@ async fn handle_message(
         .unwrap_or(true);
     if should_diag {
         last_diag.insert(symbol.to_string(), Instant::now());
-        tracing::debug!(symbol, bid = bid.0, ask = ask.0, spread_pct = spread_pct * 100.0, net_edge_pct = net_edge * 100.0, "snapshot de spread (order flow)");
+        tracing::debug!(symbol, bid = bid.0, ask = ask.0, spread_pct = spread_pct * 100.0, net_edge_pct = instant_edge * 100.0, "snapshot de spread (order flow)");
     }
 
-    if net_edge <= MIN_NET_EDGE {
+    if instant_edge <= MIN_NET_EDGE {
         return;
     }
 
@@ -206,22 +283,47 @@ async fn handle_message(
     }
     last_emitted.insert(symbol.to_string(), Instant::now());
 
+    // Registra a hipótese pra ser conferida contra o preço real daqui a
+    // CONFIRMATION_WINDOW — isso acontece SEMPRE que o gate de fee é
+    // cruzado, independente de já ter amostra suficiente pra confiar
+    // (é assim que a amostra cresce).
+    pending_confirmations.push(PendingConfirmation {
+        symbol: symbol.to_string(),
+        entry_mid: mid,
+        entry_edge: instant_edge,
+        fired_at: Instant::now(),
+    });
+
+    let (net_edge, confidence, confirmation_note) = match empirical_edge(confirmation_history) {
+        Some((edge, conf)) => {
+            let wins = confirmation_history.iter().filter(|&&r| r > 0.0).count();
+            (edge, conf, format!(
+                "edge instantâneo {:+.3}%, confirmação real: {wins}/{} acertos, retorno médio {:+.3}%",
+                instant_edge * 100.0, confirmation_history.len(), edge * 100.0
+            ))
+        }
+        None => (0.0, 0.3, format!(
+            "edge instantâneo {:+.3}%, aguardando confirmação ({}/{MIN_CONFIRMATION_SAMPLES} amostras)",
+            instant_edge * 100.0, confirmation_history.len()
+        )),
+    };
+
     let notional = bid.1.min(ask.1) * mid;
     let capital_needed = notional.min(40.0).max(5.0);
 
     let opp = Opportunity {
         market: Market::Crypto,
         strategy: Strategy::OrderFlow,
-        asset: symbol.to_string(),
+        // Bybit spot é a única exchange do Order Flow — rotulado aqui pra
+        // ficar visível no dashboard sem depender de saber o código de cor.
+        asset: format!("{symbol} [Bybit spot; {confirmation_note}]"),
         direction: Direction::Long,
         net_edge,
-        confidence: 0.45,
+        confidence,
         valid_for_ms: 600,
-        // Cotação passiva (maker) — não preenche instantaneamente como uma
-        // ordem a mercado; 30s é uma estimativa de espera até o fill, não
-        // validada contra fill real (não temos como medir isso em paper
-        // trading sem livro de ordens de verdade).
-        expected_holding_secs: 30.0,
+        // Cotação passiva (maker) — mesma janela usada pela camada de
+        // confirmação acima, não mais uma estimativa solta.
+        expected_holding_secs: CONFIRMATION_WINDOW.as_secs_f64(),
         capital_needed,
         max_loss_pct: 0.003,
         leverage: 1.0,

@@ -1,6 +1,17 @@
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+/// Piso de tempo real entre dois aumentos de perna da MESMA estratégia —
+/// além da contagem de ciclos (`min_cycles_between_scale`, que sozinha não
+/// segura nada quando o ritmo de trades é alto). Achado ao vivo
+/// (13/08/2026): com centenas de ciclos/minuto, 50 ciclos passam em
+/// segundos, e o Kelly fracionário comprime em cima de si mesmo repetidas
+/// vezes por minuto — equity simulado foi de US$195 a US$2.727 em menos de
+/// 2h por causa disso, um ritmo que nenhuma estratégia real sustentaria
+/// (taxas de exchange, seleção adversa, limite de requisições da API).
+const MIN_TIME_BETWEEN_SCALE: Duration = Duration::from_secs(300);
 
 use crate::types::{Opportunity, Strategy};
 
@@ -158,6 +169,16 @@ pub struct StrategyScaling {
     /// filtro de qualidade recente, não capital; perdê-la só significa
     /// esperar a janela reencher).
     pub recent_pnls: VecDeque<f64>,
+    /// Achado ao vivo (13/08/2026, pedido do usuário: "quero... dentro da
+    /// realidade"): `cycles_since_scale` sozinho permitia escalonar em
+    /// SEGUNDOS quando o ritmo de trades é alto (centenas de ciclos/min) —
+    /// o parâmetro `min_cycles_between_scale=50` foi calibrado pra um
+    /// ritmo bem mais lento. Equity simulado foi de US$195 a US$2.727 em
+    /// menos de 2h por causa disso. Este campo (não persiste — mesmo
+    /// raciocínio de `recent_pnls`) garante uma janela mínima de TEMPO
+    /// real decorrido, além da contagem de ciclos, antes de autorizar
+    /// outro aumento de perna.
+    pub last_scale_at: Instant,
 }
 
 impl StrategyScaling {
@@ -169,6 +190,7 @@ impl StrategyScaling {
             trough_since_peak: 0.0,
             cycles_since_scale: 0,
             recent_pnls: VecDeque::new(),
+            last_scale_at: Instant::now(),
         }
     }
 }
@@ -323,6 +345,7 @@ impl PortfolioState {
                             trough_since_peak: sc.trough_since_peak,
                             cycles_since_scale: sc.cycles_since_scale,
                             recent_pnls: VecDeque::new(),
+                            last_scale_at: Instant::now(),
                         },
                         // Save de antes desta revisão (12/08/2026): não tem
                         // strategy_scaling nenhum ainda — usa o leg_size
@@ -961,7 +984,8 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
         return Vec::new();
     };
 
-    let enough_cycles = scaling.cycles_since_scale >= cfg.scaling.min_cycles_between_scale;
+    let enough_cycles = scaling.cycles_since_scale >= cfg.scaling.min_cycles_between_scale
+        && scaling.last_scale_at.elapsed() >= MIN_TIME_BETWEEN_SCALE;
     let low_drawdown = drawdown < cfg.scaling.max_drawdown_pct_for_scale;
 
     // Recuperação parcial (task #98): em vez de exigir `cumulative_pnl` no
@@ -991,6 +1015,7 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
     let target_size = kelly_target_size(scaling, cfg, equity).unwrap_or(old_size * cfg.scaling.scale_growth_factor);
     let new_size = target_size.min(max_leg).max(1.0);
     scaling.cycles_since_scale = 0;
+    scaling.last_scale_at = Instant::now();
 
     if (new_size - old_size).abs() < 0.01 {
         return Vec::new();

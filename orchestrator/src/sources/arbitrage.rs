@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -32,22 +32,25 @@ const BITGET_WS_URL: &str = "wss://ws.bitget.com/v2/ws/public";
 const BYBIT_TAKER_FEE: f64 = 0.001;
 const BITGET_TAKER_FEE: f64 = 0.001;
 const ROUND_TRIP_FEE: f64 = BYBIT_TAKER_FEE + BITGET_TAKER_FEE;
-
-// Achado da análise de breakeven (backtests/edge_threshold_analysis.py,
-// 12/08/2026): o próprio modelo de confiança usado na simulação
-// (confidence = 0.5 + edge*25, clamp 0.4–0.9) implica que o valor esperado
-// só fica positivo a partir de ~0,54% de edge líquido — abaixo disso, o
-// ganho médio esperado (confidence*edge) não cobre a perda esperada
-// ((1-confidence)*max_loss_pct). O limiar antigo de 0,06% deixava passar
-// operações que o PRÓPRIO sistema já sabia ser -EV, o que bate exatamente
-// com o achado real: 56%+ de acerto e ainda assim prejuízo líquido
-// acumulado. Ajustado com uma margem de segurança acima do breakeven
-// teórico (0,544%) para cobrir custos de execução não modelados.
 const MIN_NET_EDGE: f64 = 0.0065;
 // Não reemitir a mesma direção/símbolo com mais frequência que isso — o book
 // atualiza a cada poucos milissegundos, mas o orquestrador não precisa (nem
 // quer) reavaliar a mesma oportunidade centenas de vezes por segundo.
 const EMIT_COOLDOWN: Duration = Duration::from_millis(700);
+
+// Camada de confirmação por preço (achado ao vivo, 13/08/2026, pedido do
+// usuário: "eu realmente não quero nada falso... tudo completamente próximo
+// ou replicado da realidade"): substitui `confidence = 0,5 + edge×25`
+// (fórmula nunca validada) por uma pergunta real — o MESMO spread, na MESMA
+// direção, ainda existia no book de verdade alguns segundos depois? Isso é
+// literalmente o risco de latência de execução cross-exchange: entre ver o
+// spread e as duas pernas realmente chegarem nas duas exchanges, o preço
+// pode já ter andado. 2s é uma estimativa de latência real de round-trip
+// numa conexão doméstica comum (não colocada fisicamente perto do
+// servidor) — bem mais realista que assumir fill instantâneo.
+const CONFIRMATION_WINDOW: Duration = Duration::from_secs(2);
+const MIN_CONFIRMATION_SAMPLES: usize = 30;
+const CONFIRMATION_HISTORY_CAP: usize = 500;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct TopOfBook {
@@ -64,6 +67,33 @@ impl TopOfBook {
 }
 
 type BookMap = Arc<RwLock<HashMap<String, TopOfBook>>>;
+
+struct PendingConfirmation {
+    symbol: String,
+    direction: &'static str,
+    fired_at: Instant,
+}
+
+#[derive(Default)]
+struct ConfirmationState {
+    history: VecDeque<f64>,
+    pending: Vec<PendingConfirmation>,
+}
+
+type SharedConfirmation = Arc<Mutex<ConfirmationState>>;
+
+/// Calcula (net_edge, confidence) a partir do histórico real de confirmações
+/// — recomputado contra o book de verdade `CONFIRMATION_WINDOW` depois do
+/// sinal, nunca escolhido a dedo. `None` enquanto a amostra for pequena
+/// demais pra significar algo (mesmo padrão do Pump Exhaustion/Order Flow).
+fn empirical_edge(history: &VecDeque<f64>) -> Option<(f64, f64)> {
+    if history.len() < MIN_CONFIRMATION_SAMPLES {
+        return None;
+    }
+    let avg_return = history.iter().sum::<f64>() / history.len() as f64;
+    let win_rate = history.iter().filter(|&&r| r > 0.0).count() as f64 / history.len() as f64;
+    Some((avg_return.max(0.0), win_rate.clamp(0.1, 0.9)))
+}
 
 /// Fase 1 do roadmap: compara o topo do book da Bybit e da Bitget para os
 /// mesmos pares e emite `Opportunity` reais quando o spread líquido (já
@@ -94,6 +124,11 @@ impl SignalSource for ArbitrageSource {
     }
 
     async fn run(&mut self, tx: Sender<Opportunity>) -> anyhow::Result<()> {
+        // Fora do loop de propósito (mesmo raciocínio do Pump
+        // Exhaustion/Order Flow): sobrevive à rotação de universo (a cada
+        // 15min) e a reconexões — só ele que torna net_edge real possível.
+        let confirmation: SharedConfirmation = Arc::new(Mutex::new(ConfirmationState::default()));
+
         loop {
             let symbols = self.symbols_rx.borrow().clone();
             let bybit_books: BookMap = Arc::new(RwLock::new(HashMap::new()));
@@ -110,8 +145,9 @@ impl SignalSource for ArbitrageSource {
             let tx2 = tx.clone();
             let bus2 = self.bus.clone();
             let edge_scores2 = self.edge_scores.clone();
+            let confirmation2 = confirmation.clone();
             let comparator_handle = tokio::spawn(async move {
-                run_comparator(symbols, bybit_books, bitget_books, tx2, bus2, edge_scores2).await
+                run_comparator(symbols, bybit_books, bitget_books, tx2, bus2, edge_scores2, confirmation2).await
             });
 
             // As 3 tarefas rodam pra sempre sozinhas (cada uma já reconecta
@@ -307,7 +343,16 @@ async fn handle_bitget_message(text: &str, books: &BookMap) {
 
 // ---------------- comparador ----------------
 
-async fn run_comparator(symbols: Vec<String>, bybit: BookMap, bitget: BookMap, tx: Sender<Opportunity>, bus: EventBus, edge_scores: EdgeScores) {
+#[allow(clippy::too_many_arguments)]
+async fn run_comparator(
+    symbols: Vec<String>,
+    bybit: BookMap,
+    bitget: BookMap,
+    tx: Sender<Opportunity>,
+    bus: EventBus,
+    edge_scores: EdgeScores,
+    confirmation: SharedConfirmation,
+) {
     let mut last_emitted: HashMap<(String, &'static str), Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(150));
     let mut last_diag = Instant::now() - Duration::from_secs(60);
@@ -325,6 +370,41 @@ async fn run_comparator(symbols: Vec<String>, bybit: BookMap, bitget: BookMap, t
         if diag_now {
             last_diag = Instant::now();
         }
+
+        // Resolve confirmações cuja janela já passou — recomputa a MESMA
+        // direção com o book de VERDADE agora, em vez de sortear.
+        let due: Vec<PendingConfirmation> = {
+            let mut guard = confirmation.lock().unwrap();
+            let now = Instant::now();
+            let (due, still_pending): (Vec<_>, Vec<_>) = guard
+                .pending
+                .drain(..)
+                .partition(|p| now.duration_since(p.fired_at) >= CONFIRMATION_WINDOW);
+            guard.pending = still_pending;
+            due
+        };
+        if !due.is_empty() {
+            let bybit_snapshot = bybit.read().await.clone();
+            let bitget_snapshot = bitget.read().await.clone();
+            let mut guard = confirmation.lock().unwrap();
+            for p in due {
+                let (Some(bb), Some(bg)) = (bybit_snapshot.get(&p.symbol), bitget_snapshot.get(&p.symbol)) else {
+                    continue;
+                };
+                if !bb.is_valid() || !bg.is_valid() {
+                    continue;
+                }
+                let realized_return = match p.direction {
+                    "buy_bitget_sell_bybit" => (bb.bid - bg.ask) / bg.ask - ROUND_TRIP_FEE,
+                    _ => (bg.bid - bb.ask) / bb.ask - ROUND_TRIP_FEE,
+                };
+                guard.history.push_back(realized_return);
+                while guard.history.len() > CONFIRMATION_HISTORY_CAP {
+                    guard.history.pop_front();
+                }
+            }
+        }
+
         for symbol in &symbols {
             let (bb, bg) = {
                 let a = bybit.read().await;
@@ -375,10 +455,10 @@ async fn run_comparator(symbols: Vec<String>, bybit: BookMap, bitget: BookMap, t
             }
 
             if edge_1 > MIN_NET_EDGE {
-                maybe_emit(&tx, &mut last_emitted, symbol, "buy_bitget_sell_bybit", edge_1, bg.ask_qty * bg.ask, &tx_asset(symbol)).await;
+                maybe_emit(&tx, &mut last_emitted, symbol, "buy_bitget_sell_bybit", edge_1, bg.ask_qty * bg.ask, &confirmation).await;
             }
             if edge_2 > MIN_NET_EDGE {
-                maybe_emit(&tx, &mut last_emitted, symbol, "buy_bybit_sell_bitget", edge_2, bb.ask_qty * bb.ask, &tx_asset(symbol)).await;
+                maybe_emit(&tx, &mut last_emitted, symbol, "buy_bybit_sell_bitget", edge_2, bb.ask_qty * bb.ask, &confirmation).await;
             }
 
             let best_edge_here = edge_1.max(edge_2);
@@ -396,8 +476,11 @@ async fn run_comparator(symbols: Vec<String>, bybit: BookMap, bitget: BookMap, t
     }
 }
 
-fn tx_asset(symbol: &str) -> String {
-    symbol.to_string()
+fn direction_label(direction_key: &str) -> &'static str {
+    match direction_key {
+        "buy_bitget_sell_bybit" => "compra Bitget → vende Bybit",
+        _ => "compra Bybit → vende Bitget",
+    }
 }
 
 async fn maybe_emit(
@@ -405,9 +488,9 @@ async fn maybe_emit(
     last_emitted: &mut HashMap<(String, &'static str), Instant>,
     symbol: &str,
     direction_key: &'static str,
-    net_edge: f64,
+    instant_edge: f64,
     notional_available: f64,
-    asset: &str,
+    confirmation: &SharedConfirmation,
 ) {
     let key = (symbol.to_string(), direction_key);
     if let Some(t) = last_emitted.get(&key) {
@@ -417,28 +500,56 @@ async fn maybe_emit(
     }
     last_emitted.insert(key, Instant::now());
 
+    // Registra a hipótese pra ser conferida contra o book real daqui a
+    // CONFIRMATION_WINDOW — acontece sempre que o gate de fee é cruzado,
+    // independente de já ter amostra suficiente pra confiar.
+    let (net_edge, confidence, confirmation_note) = {
+        let mut guard = confirmation.lock().unwrap();
+        guard.pending.push(PendingConfirmation {
+            symbol: symbol.to_string(),
+            direction: direction_key,
+            fired_at: Instant::now(),
+        });
+        match empirical_edge(&guard.history) {
+            Some((edge, conf)) => {
+                let wins = guard.history.iter().filter(|&&r| r > 0.0).count();
+                (edge, conf, format!(
+                    "edge instantâneo {:+.3}%, confirmação real: {wins}/{} acertos, retorno médio {:+.3}%",
+                    instant_edge * 100.0, guard.history.len(), edge * 100.0
+                ))
+            }
+            None => (0.0, 0.3, format!(
+                "edge instantâneo {:+.3}%, aguardando confirmação ({}/{MIN_CONFIRMATION_SAMPLES} amostras)",
+                instant_edge * 100.0, guard.history.len()
+            )),
+        }
+    };
+
     // Nunca reivindicar mais capital do que o topo do book realmente
     // suporta, e nunca acima de um teto de sanidade — o motor de risco ainda
     // vai clampar isso ao tamanho de perna configurado.
     let capital_needed = notional_available.min(50.0).max(5.0);
     // Risco de execução de arbitragem (uma perna preenche, a outra não a
-    // tempo, ou o preço se move entre as duas pontas) — não é uma distância
-    // de stop como em trades direcionais; usamos uma estimativa fixa
-    // conservadora até termos dado real de fill-rate para calibrar.
+    // tempo, ou o preço se move entre as duas pontas) — agora medido pela
+    // camada de confirmação acima, não mais uma estimativa fixa.
     let max_loss_pct = 0.004;
-    let confidence = (0.5 + net_edge * 25.0).clamp(0.4, 0.9);
+
+    // Rótulo de exchange/direção exposto no próprio `asset` (achado do
+    // usuário, 13/08/2026: "onde que é essas operações bybit ou bitget?
+    // tem como diferenciar isso em algum lugar?" — não tinha. Agora tem.
+    let asset = format!("{symbol} [{}; {confirmation_note}]", direction_label(direction_key));
 
     let opp = Opportunity {
         market: Market::Crypto,
         strategy: Strategy::Arbitrage,
-        asset: asset.to_string(),
+        asset,
         direction: Direction::Long,
         net_edge,
         confidence,
         valid_for_ms: 900,
-        // Duas pernas em duas exchanges, mas cada uma resolve em
-        // milissegundos — segundos de sobra pra latência de rede real.
-        expected_holding_secs: 3.0,
+        // Duas pernas em duas exchanges — mesma janela usada pela camada de
+        // confirmação acima, não mais uma estimativa solta.
+        expected_holding_secs: CONFIRMATION_WINDOW.as_secs_f64(),
         capital_needed,
         max_loss_pct,
         leverage: 1.0,
