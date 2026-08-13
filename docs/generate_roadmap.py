@@ -19,7 +19,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas as canvas_module
 from reportlab.platypus import (
     BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer, Table,
-    TableStyle, PageBreak, ListFlowable, ListItem,
+    TableStyle, PageBreak, ListFlowable, ListItem, KeepTogether,
 )
 from reportlab.platypus.tableofcontents import TableOfContents
 from reportlab.graphics.shapes import Drawing, Rect, String, Line, Group, Path
@@ -442,7 +442,7 @@ def build():
     story.append(callout_box(
         "capital_at_risk = order_size &#215; opp.max_loss_pct<br/>"
         "strategy_limit = strategy_risk_pct &#215; equity<br/>"
-        "aprovado apenas se: exposicao_atual + capital_at_risk &#8804; strategy_limit",
+        "aprovado apenas se: exposicao_atual + capital_at_risk &lt;= strategy_limit",
         border_color=CYAN, bg=colors.HexColor("#E7F8FC"),
     ))
     story.append(Spacer(1, 4))
@@ -552,7 +552,7 @@ def build():
     ]))
     story.append(callout_box(
         "<b>Efeito medido ao vivo:</b> cobertura de simbolos com amostra real no universo de perpetuos "
-        "mais que triplicou (60 &#8594; 208 simbolos) na primeira rotacao apos a correcao — o Order Flow "
+        "mais que triplicou (60 -&gt; 208 simbolos) na primeira rotacao apos a correcao — o Order Flow "
         "estava, sem saber, gritando no vazio para sete simbolos o tempo todo em vez de medir o resto do "
         "mercado.",
         border_color=POSITIVE, bg=colors.HexColor("#E4F5EE"),
@@ -587,16 +587,22 @@ def build():
         border_color=CYAN, bg=colors.HexColor("#E7F8FC"),
     ))
 
-    story.append(PageBreak())
-
+    # PageBreak forcado removido (polimento visual, 13/08/2026): deixava a
+    # pagina anterior com mais de 600pt de espaco vazio (~80% da pagina)
+    # quando o conteudo da Secao 1 terminava cedo — o titulo + paragrafo de
+    # abertura da Secao 2 abaixo (protegidos por KeepTogether) agora fluem
+    # naturalmente pro espaco que sobrar; o diagrama de maturidade, sendo um
+    # elemento atomico, pula pra pagina seguinte sozinho se nao couber.
     # ------------------------------------------------------------- Sec2 (maturidade)
-    story.append(P("2. Modelo de maturidade por estrategia", "H1"))
-    story.append(P(
-        "A v1 deste roadmap organizava tudo em fases estritamente sequenciais (Fase 1 -> Fase 2 -> "
-        "... -> Fase 12), o que sugeria — incorretamente — que nenhuma estrategia poderia chegar perto "
-        "de capital real ate o sistema inteiro estar pronto. Isso nao combina com o objetivo de "
-        "acelerar sem cortar caminho na seguranca. A partir desta revisao, cada estrategia avanca "
-        "numa escada de maturidade <b>independente</b>:", "Body"))
+    story.append(KeepTogether([
+        P("2. Modelo de maturidade por estrategia", "H1"),
+        P(
+            "A v1 deste roadmap organizava tudo em fases estritamente sequenciais (Fase 1 -> Fase 2 -> "
+            "... -> Fase 12), o que sugeria — incorretamente — que nenhuma estrategia poderia chegar perto "
+            "de capital real ate o sistema inteiro estar pronto. Isso nao combina com o objetivo de "
+            "acelerar sem cortar caminho na seguranca. A partir desta revisao, cada estrategia avanca "
+            "numa escada de maturidade <b>independente</b>:", "Body"),
+    ]))
     story.append(maturity_ladder_diagram())
     story.append(Spacer(1, 6))
     story.append(P(
@@ -655,7 +661,7 @@ def build():
     story.append(P(
         "Corrigido com o percentil 90 real de cada métrica na própria distribuição observada — não "
         "chute, não arredondamento por sensação: funding &gt;0,015%/8h, pump 24h &gt;3%, crescimento "
-        "de OI em 1h &gt;1%. Combinados (&#8805;2 de 3), isso ocorre em 0,35% dos snapshots observados "
+        "de OI em 1h &gt;1%. Combinados (&gt;=2 de 3), isso ocorre em 0,35% dos snapshots observados "
         "(~59 vezes no período de referência) — raro o suficiente pra ainda ser um sinal seletivo, "
         "frequente o suficiente pra a camada de confirmação de preço (Seção 2.1, mínimo de 20 "
         "confirmações) conseguir acumular amostra em tempo razoável.", "Body"))
@@ -686,8 +692,8 @@ def build():
         "ponderada contínua das 3 dimensões (usada só para o heartbeat do dashboard até então) — a "
         "distribuição real desse score, medida nas mesmas 3.000 amostras, tem espalhamento genuíno "
         "(p50=0,27, p75=0,43, p90=0,58, p95=0,72, p99=0,91). O gatilho passou a usar esse score "
-        "diretamente, calibrado no seu próprio percentil observado (&#8805;0,60 dispara sozinho; "
-        "&#8805;0,40 dispara combinado com reforço de fusão — Seção 1.5), em vez de exigir dois "
+        "diretamente, calibrado no seu próprio percentil observado (&gt;=0,60 dispara sozinho; "
+        "&gt;=0,40 dispara combinado com reforço de fusão — Seção 1.5), em vez de exigir dois "
         "cruzamentos discretos que na prática nunca se encontravam.", "Body"))
     story.append(callout_box(
         "<b>Resultado verificado ao vivo, não estimado:</b> 10 candidatos detectados nos primeiros 90 "
@@ -747,6 +753,24 @@ def build():
         "Simulacao Monte Carlo da sequencia de operacoes (reordenar os trades e checar se o resultado depende da ordem em que vieram).",
         "Resultado nao dependente de uma unica operacao excepcional (remover o melhor trade e checar se o resultado ainda e positivo).",
     ]))
+    story.append(callout_box(
+        "<b>Honestidade sobre quais destes já rodam de verdade (13/08/2026) — esta lista é um "
+        "alvo, não uma descrição do código atual:</b> IMPLEMENTADOS e rodando em produção — profit "
+        "factor mínimo (com hierarquia de 2 níveis, Seção 9.1), drawdown máximo (kill-switch + teto "
+        "não-destrutivo, Seção 9.2), número mínimo de operações por classe de estratégia (Seção 8.2), "
+        "e resultado não dependente do melhor trade (<font face='JetBrainsMono'>risk::"
+        "positive_excluding_best_trade</font>). NÃO IMPLEMENTADOS ainda, continuam só nesta lista de "
+        "alvo — CVaR/expected shortfall da cauda de perdas, simulação Monte Carlo de reordenação, "
+        "desempenho fora da amostra (validação out-of-sample formal) e teste de estresse com latência/"
+        "slippage maiores que o observado. O que a <font face='JetBrainsMono'>score()</font> real do "
+        "sistema calcula hoje (Seção 1.2) é bem mais simples que essa lista inteira: "
+        "<font face='JetBrainsMono'>net_edge&#215;confidence &#247; max_loss_pct &#247; capital_needed "
+        "&#247; horas_de_holding</font> — um ranking de prioridade entre candidatos já aprovados pelo "
+        "motor de risco, não um score de aprovação com CVaR ou probabilidade de execução embutidos. "
+        "Confundir os dois (o score que RANQUEIA com os critérios que APROVAM promoção de estágio) foi "
+        "um erro de revisões anteriores deste documento — corrigido aqui.",
+        border_color=RISK_RED, bg=colors.HexColor("#FBE9EC"),
+    ))
 
     story.append(PageBreak())
 
@@ -858,23 +882,32 @@ def build():
     story.append(P("7. Resultados reais ate agora", "H1"))
     story.append(P(
         "Numeros medidos, nao estimados — extraidos de <font face='JetBrainsMono'>orchestrator/data/"
-        "events.jsonl</font> (2596 eventos) via <font face='JetBrainsMono'>backtests/"
+        "events.jsonl</font> (134.493 eventos acumulados) via <font face='JetBrainsMono'>backtests/"
         "live_performance_report.py</font>, do backtest historico via "
         "<font face='JetBrainsMono'>backtests/pump_exhaustion_historical.py</font> contra dado real "
         "da Bybit, e da analise de breakeven via "
         "<font face='JetBrainsMono'>backtests/edge_threshold_analysis.py</font> (Secao 7.1):", "Body"))
     story.append(section_table([
         ["Estrategia", "Operacoes", "Taxa de acerto", "PnL liquido", "Leitura"],
-        ["Arbitragem", "222", "56,3%", "-US$3,96", "§MONO§negativo apesar do acerto > 50%"],
-        ["Order Flow", "130", "42,3%", "-US$0,21", "§MONO§negativo, amostra pequena"],
+        ["Arbitragem", "3.356", "87,9%", "+US$1.002,79", "§MONO§positivo, razao risco/retorno 1,70"],
+        ["Order Flow", "19.059", "90,9%", "+US$2.268,81", "§MONO§positivo, razao risco/retorno 2,07"],
+        ["Pump Exhaustion", "0", "—", "US$0,00", "§MONO§ainda sem trade (net_edge=0 ate acumular amostra de confirmacao — Secao 2.1)"],
     ], [90, 75, 90, 90, 145]))
     story.append(Spacer(1, 6))
     story.append(callout_box(
-        "<b>Exatamente o padrao que a Secao 3.1 existe para prevenir:</b> arbitragem acerta a maioria "
-        "das operacoes (56,3%) e ainda assim perde dinheiro no acumulado — as perdas sao maiores que "
-        "os ganhos em media (razao risco/retorno medida: 0,23). Isso nao e um bug: e o motivo pelo "
-        "qual nenhuma das duas esta perto de avancar na escada de maturidade da Secao 2.",
-        border_color=RISK_RED, bg=colors.HexColor("#FBE9EC"),
+        "<b>Isto nao e a mesma medicao da v2 deste documento</b> (que mostrava 56,3%/-US$3,96 em "
+        "arbitragem e 42,3%/-US$0,21 em order flow — o padrao que a Secao 3.1 existe pra prevenir: "
+        "acerto alto e ainda assim prejuizo, porque as perdas eram maiores que os ganhos em media). "
+        "Aquele numero era de ANTES da correcao de breakeven (Secao 7.1, MIN_NET_EDGE elevado acima "
+        "do breakeven teorico) e de antes de toda a rodada de realismo de execucao desta revisao "
+        "(Secao 12.5 — exposicao simultanea real, reamostragem por bootstrap em vez de sorteio "
+        "formulaico, deduplicacao de sinais sobrepostos). Os numeros acima sao positivos, mas vem de "
+        "um log ACUMULADO desde o inicio do desenvolvimento — misturam ciclos de codigo antigos "
+        "(round-trip instantaneo, sem rate limit, sem notional minimo real) com os ciclos mais "
+        "recentes e mais realistas. Nao e uma medicao limpa de 'quanto o sistema ganha desde que "
+        "ficou 100% real' — e por isso que o criterio da Fase 11 (Secao 8.2) precisa contar a janela "
+        "de validacao a PARTIR de agora, nao reaproveitar este historico misto.",
+        border_color=GOLD, bg=GOLD_SOFT,
     ))
     story.append(Spacer(1, 6))
     story.append(P("7.1 Causa raiz encontrada e corrigida — limiares abaixo do breakeven", "H2"))
@@ -943,26 +976,29 @@ def build():
     ))
 
     story.append(P(
-        "<b>Pump Exhaustion (backtest historico, 60 dias, 30 simbolos, dado real Bybit):</b> o gatilho "
-        "exato do detector em producao (funding &gt;0,10%/8h E variacao de 24h &gt;+15%, simultaneos) "
-        "<b>nao disparou nenhuma vez</b> nesta janela. Isso significa que o criterio de saida da Fase "
-        "6/10 ainda nao pode ser avaliado — nao ha amostra para comparar contra o marcador aleatorio. "
-        "Duas leituras possiveis, ainda em aberto: (a) o limiar esta calibrado forte demais para o "
-        "regime de volatilidade atual, ou (b) o padrao de exaustao que ele busca e genuinamente raro "
-        "nessa resolucao horaria.", "Body"))
+        "<b>Pump Exhaustion — recalibrado por percentil real, gatilho corrigido (13/08/2026):</b> os "
+        "limiares descritos nas revisoes anteriores deste documento (funding &gt;0,10%/8h E variacao "
+        "de 24h &gt;+15%, simultaneos — o \"gatilho em producao\" citado ali) nunca chegaram a rodar de "
+        "verdade: analisando 17h de dado bruto acumulado (30 simbolos), pump nunca passou de 7,5% nem "
+        "OI de 5,2% no periodo — os limiares estavam calibrados pra um regime bem mais volatil do que "
+        "o observado, e o criterio \"2 de 3 sinais simultaneos\" partia de uma premissa que os proprios "
+        "dados contradiziam: em 3.000 amostras, funding cruzou o limiar 249 vezes, pump 175 vezes, OI 4 "
+        "vezes, mas NUNCA dois ao mesmo tempo no mesmo simbolo. O gatilho nao era so raro, era "
+        "estruturalmente inatingivel.", "Body"))
     story.append(Spacer(1, 4))
     story.append(P(
-        "<b>Calibracao feita (backtests/pump_exhaustion_calibration.py):</b> varredura de 25 "
-        "combinacoes de limiares sobre o mesmo dado real. Resultado: o gargalo e o limiar de "
-        "<b>funding</b>, nao o de pump — mesmo afrouxando o pump para &gt;3%, nenhum sinal aparece "
-        "enquanto funding&gt;0,07%. Só a partir de funding&gt;0,05% um símbolo (SANDUSDT) começa a "
-        "aparecer; em funding&gt;0,02% + pump&gt;3% (5x mais frouxo que produção nos dois eixos) "
-        "chegam 78 sinais em 7 símbolos — ainda abaixo do minimo de operacoes exigido pela Secao 3.1. "
-        "Leitura honesta: no regime de volatilidade de 2026, funding raramente ficou tao esticado "
-        "quanto o limiar de producao pressupoe — nao e uma recomendacao de afrouxar o limiar de "
-        "producao (mudaria o que 'exaustao' significa), e sim evidencia de que este detector "
-        "especificamente precisa de uma janela de dado mais longa (meses, nao 60 dias) antes que a "
-        "Fase 6/10 tenha amostra suficiente pra validar.", "Body"))
+        "Substituido por um gatilho continuo baseado no proprio score ponderado das 3 dimensoes "
+        "(<font face='JetBrainsMono'>exhaustion_score</font>), calibrado no percentil real observado "
+        "da propria distribuicao (nao um numero escolhido a dedo): dispara sozinho acima de "
+        "p90 (score &gt;= 0,60), ou combinado com reforco de fusao (Liquidation Hunter/Whale Watch) "
+        "acima de p75 (score &gt;= 0,40). Limiares individuais tambem recalibrados pro percentil real: "
+        "funding &gt;0,015%/8h (era 0,10%) e pump 24h &gt;3% (era 15%). Verificado ao vivo: 0 sinais em "
+        "17h antes da correcao, dezenas de candidatos nos primeiros minutos depois. O modulo agora "
+        "tambem tem a mesma camada de confirmacao de preco real das outras duas estrategias que "
+        "executam trade (Order Flow/Arbitragem) — inclusive a mesma taxa de execucao descontada no "
+        "edge medido e o mesmo sorteio por bootstrap de desfecho real (Secao 12.5) — mas ainda esta "
+        "acumulando as 20 amostras confirmadas minimas antes de net_edge sair de 0.0; 0 trades "
+        "executados ate a medicao mais recente (Secao 7).", "Body"))
 
     story.append(PageBreak())
 
@@ -1007,12 +1043,26 @@ def build():
         "correcao ficariam misturados de forma enganosa. Rode a qualquer momento pra ver o progresso "
         "atual, sem precisar recalcular na mao.", "Body"))
     story.append(P(
-        "Nao sao mais placeholder generico — abaixo estao numeros propostos nesta revisao, prontos "
-        "pra virar gate real no codigo assim que confirmados (ou ajustados) por voce:", "Body"))
+        "Nao sao mais placeholder generico — mas tambem nao sao mais um numero UNICO pra todas as "
+        "estrategias. Revisao tecnica externa (13/08/2026): \"um requisito unico de 150 operacoes e "
+        "pouco pra estrategias rapidas e talvez inalcancavel pra eventos raros — cada estrategia "
+        "precisa de criterio proprio\", implementado em "
+        "<font face='JetBrainsMono'>backtests/fase11_progress.py::STRATEGY_CRITERIA</font>:", "Body"))
+    story.append(section_table([
+        ["Classe", "Estrategias", "Operacoes minimas", "Profit factor minimo", "Semanas distintas minimas"],
+        ["Continua (alto volume)", "Arbitragem, Order Flow", "150", "1,3", "4"],
+        ["Evento raro c/ confirmacao", "Pump Exhaustion", "20 (mesmo piso de MIN_CONFIRMATION_SAMPLES)", "1,1", "6"],
+        ["Observacional (net_edge=0)", "Whale Watch, News, Macro, Launch Radar, Liquidation Hunter, Multi-Asset", "sem gate — nunca executam", "—", "—"],
+    ], [110, 120, 105, 75, 80]))
+    story.append(Spacer(1, 4))
+    story.append(P(
+        "<b>Por que \"semanas distintas\", nao so contagem bruta:</b> 2ª revisao tecnica externa "
+        "(13/08/2026) — 20 amostras que acontecem todas na MESMA semana (ou pior, no mesmo dia) nao "
+        "provam nada sobre regimes de mercado diferentes. Estrategias continuas ja cobrem varias "
+        "semanas so pelo volume; estrategias raras precisam do minimo EXPLICITO de semanas com pelo "
+        "menos 1 amostra cada.", "Body"))
     story.append(bullets([
-        "Minimo 4 semanas consecutivas de paper trading com dado 100% real, sem interrupcao nao planejada acima de 24h.",
-        "Minimo 150 operacoes executadas nesse periodo, por estrategia (amostra pequena demais nao vale — ver achado da Secao 7 sobre Pump Exhaustion com 0 sinais).",
-        "Resultado liquido acumulado positivo apos custos simulados, com profit factor &#8805; 1,3.",
+        "Minimo 4 semanas consecutivas de paper trading com dado 100% real, sem interrupcao nao planejada acima de 24h (piso do relogio da Fase 11, independente do criterio por classe acima).",
         "Drawdown maximo nunca ultrapassa o limite configurado (Secao 9) sem que a reducao automatica de perna tenha acionado corretamente.",
         "Zero violacoes de limite de risco nos logs (toda oportunidade fora do limite foi corretamente rejeitada).",
         "Revisao manual sua dos logs de decisao — nao so do resultado final acumulado.",
@@ -1025,7 +1075,7 @@ def build():
         "local, ativo). Detalhes de cada uma na Secao 12.", "Body"))
 
     story.append(P("9. Parametros de risco atuais", "H1"))
-    story.append(P("Espelha exatamente <font face='JetBrainsMono'>orchestrator/config/risk.toml</font> em producao:", "Body"))
+    story.append(P("Espelha exatamente <font face='JetBrainsMono'>orchestrator/config/risk.toml</font> em producao (atualizado 13/08/2026, pos-auditoria externa de realismo de execucao — ver Secao 12.5):", "Body"))
     story.append(section_table([
         ["Parametro", "Valor", "Significado"],
         ["total_equity_start", "US$ 200", "Capital inicial de referencia para paper trading"],
@@ -1036,13 +1086,29 @@ def build():
         ["arbitrage / order_flow", "0,35% / 0,25%", "Risco maximo individual por estrategia"],
         ["news / launch", "0,15% / 0,10%", "Risco maximo individual (launch e o mais baixo do sistema)"],
         ["pump_exhaustion / whale_watch / macro / liquidation_hunter", "0,25% / 0,20% / 0,20% / 0,20%", "Risco maximo individual por estrategia"],
-        ["min_cycles_between_scale", "50 ciclos", "Ciclos minimos entre aumentos de tamanho de perna (por estrategia — Secao 9.1)"],
+        ["leverage.liquid_max / launch_max", "2,0x / 1,0x", "Alavancagem maxima de UMA oportunidade isolada, por classe (Secao 12.5)"],
+        ["leverage.global_max", "1,0x (teto absoluto no codigo: 2,0x)", "NOVO (13/08/2026) — teto de alavancagem AGREGADA de todas as posicoes abertas ao mesmo tempo, somada sobre o equity; nunca configuravel acima do teto absoluto (Secao 12.5)"],
+        ["min_cycles_between_scale", "50 ciclos", "Ciclos minimos entre ajustes de tamanho de perna (por estrategia — Secao 9.1)"],
+        ["(constante no codigo) MIN_TIME_BETWEEN_SCALE", "300s", "Piso de TEMPO REAL entre ajustes, alem da contagem de ciclos — achado ao vivo: com centenas de ciclos/min, 50 ciclos passam em segundos e o Kelly comprimia sobre si mesmo repetidas vezes por minuto (Secao 9.1)"],
         ["scale_growth_factor", "1,15 (+15%)", "Degrau fixo antigo — agora so usado como reserva quando a amostra ainda nao permite calcular Kelly (Secao 9.1)"],
-        ["partial_recovery_fraction", "80%", "Fracao do maior drawdown LOCAL da propria estrategia que precisa estar recuperada pra liberar escalonamento (novo — Secao 9.1)"],
-        ["kelly_safety_fraction", "30%", "Fracao do Kelly cheio realmente aplicada ao tamanho da perna (Kelly fracionario, novo — Secao 9.1)"],
+        ["scale_shrink_factor", "0,80 (&#8722;20%)", "NOVO (13/08/2026) — reducao ativa da perna quando o profit factor recente degrada abaixo do piso de \"continuar\" (Secao 9.1)"],
+        ["min_recent_profit_factor_for_scale / to_hold", "1,3 / 1,2", "Hierarquia de 2 niveis (13/08/2026): PF&gt;=1,3 autoriza crescer; PF&lt;1,2 forca reducao ativa; entre os dois, mantem o tamanho (Secao 9.1)"],
+        ["partial_recovery_fraction", "80%", "Fracao do maior drawdown LOCAL da propria estrategia que precisa estar recuperada pra liberar CRESCIMENTO (nao bloqueia reducao — Secao 9.1)"],
+        ["kelly_safety_fraction", "30%", "Fracao do Kelly cheio realmente aplicada ao tamanho da perna — desde 13/08/2026, a propria taxa de acerto usada no calculo e um limite inferior de confianca (Wilson, 95%), nao a taxa pontual (Secao 9.1)"],
         ["drawdown_halve_threshold_pct", "2%", "Drawdown do PORTFOLIO INTEIRO a partir do qual a perna de TODAS as estrategias e reduzida pela metade — continua global de proposito (Secao 9.1)"],
         ["max_leg_fraction_of_equity", "30%", "Fracao maxima do equity total que uma unica perna pode representar"],
     ], [190, 110, 190]))
+    story.append(Spacer(1, 4))
+    story.append(callout_box(
+        "Tres parametros NAO ficam em risk.toml, sao constantes fixas no codigo (documentadas aqui "
+        "mesmo assim, porque tambem sao \"parametro de risco em producao\"): "
+        "<font face='JetBrainsMono'>MIN_TIME_BETWEEN_SCALE</font> (300s, risk.rs), "
+        "<font face='JetBrainsMono'>ABSOLUTE_LEVERAGE_CEILING</font> (2,0x, risk.rs) e "
+        "<font face='JetBrainsMono'>LAUNCH_TRADE_ENABLED</font> (false — trava estrutural do Launch "
+        "Radar, independente do gate de score; so muda pra true com decisao explicita, nunca como "
+        "efeito colateral de outra mudanca).",
+        border_color=GOLD, bg=GOLD_SOFT,
+    ))
     story.append(callout_box(
         "<b>Nota de correcao (v1 -> v2):</b> a v1 deste documento descrevia o escalonamento como "
         "'dobra perna em nova maxima + 50 ciclos + drawdown baixo' na secao da Fase 0. Isso nunca foi "
@@ -1068,9 +1134,9 @@ def build():
         "factor e robustez-sem-melhor-trade (Secao 12.7) passam a ser medidos por estrategia, nao mais "
         "misturados.",
         "<b>Recuperacao parcial, nao pico absoluto</b> — o gate antigo exigia "
-        "<font face='JetBrainsMono'>equity &#8805; peak_equity</font> do portfolio inteiro. Agora basta "
+        "<font face='JetBrainsMono'>equity &gt;= peak_equity</font> do portfolio inteiro. Agora basta "
         "recuperar 80% (<font face='JetBrainsMono'>partial_recovery_fraction</font>) do maior drawdown "
-        "LOCAL da propria estrategia (pico&#8594;vale de PnL acumulado dela) — uma estrategia "
+        "LOCAL da propria estrategia (pico-&gt;vale de PnL acumulado dela) — uma estrategia "
         "individualmente boa nao fica mais refem de outra que ainda nao recuperou.",
         "<b>Sizing continuo por Kelly fracionario</b> — o degrau fixo de +15% e substituido por um "
         "tamanho recalculado a cada escalonamento a partir da fracao de Kelly medida na janela recente "
@@ -1096,7 +1162,7 @@ def build():
         "Secao 9.1 chamava a reducao de emergencia (halve pela metade) dentro de "
         "<font face='JetBrainsMono'>maybe_scale</font>, que roda A CADA TRADE — nao so na transicao de "
         "\"abaixo do limiar\" para \"acima do limiar\". Cada trade novo enquanto o drawdown ficasse "
-        "&#8805;2% reduzia a perna PELA METADE DE NOVO, nao uma vez so — uma unica reducao real levaria "
+        "&gt;=2% reduzia a perna PELA METADE DE NOVO, nao uma vez so — uma unica reducao real levaria "
         "US$25 para US$12,50, nao para o piso de US$1 observado. Era exatamente esse loop repetido que "
         "colapsava tudo, e sem nenhuma escada de recuperacao, ficava preso no piso indefinidamente "
         "mesmo com o drawdown oscilando perto do limiar por horas.", "Body"))
@@ -1107,9 +1173,9 @@ def build():
         "\"ja reduzi essa vez?\":", "Body"))
     story.append(section_table([
         ["Drawdown do portfolio (desde o pico)", "Teto sobre o tamanho efetivo da ordem"],
-        ["&#8805; 1,75%", "50%"],
-        ["&#8805; 1,50%", "65%"],
-        ["&#8805; 1,00%", "80%"],
+        ["&gt;= 1,75%", "50%"],
+        ["&gt;= 1,50%", "65%"],
+        ["&gt;= 1,00%", "80%"],
         ["< 1,00%", "sem teto (100%)"],
     ], [280, 210]))
     story.append(Spacer(1, 4))
@@ -1129,7 +1195,7 @@ def build():
     story.append(P("9.3 Kelly hierarquico — segunda camada por simbolo (auditoria externa, 12/08/2026)", "H2"))
     story.append(P(
         "Pedido da auditoria: \"direciona mais capital as melhores estrategias, simbolos e regimes\". "
-        "Escopo desta revisao: as duas primeiras camadas (portfolio&#8594;estrategia&#8594;SIMBOLO) — a "
+        "Escopo desta revisao: as duas primeiras camadas (portfolio-&gt;estrategia-&gt;SIMBOLO) — a "
         "camada de \"regime\" (classificacao de regime de mercado — tendencia, volatilidade) fica de "
         "fora por enquanto, nao existe nenhuma infraestrutura de deteccao de regime ainda e construir "
         "isso agora seria fabricar sofisticacao sem base real medida.", "Body"))
@@ -1309,6 +1375,21 @@ def build():
         "no mesmo arquivo — nenhuma mudança de código necessária.",
         border_color=GOLD, bg=GOLD_SOFT,
     ))
+    story.append(P("Checklist de segurança de chaves (verificado nesta revisão, 13/08/2026)", "H2"))
+    story.append(bullets([
+        "<font face='JetBrainsMono'>orchestrator/.env</font> confirmado no <font face='JetBrainsMono'>.gitignore</font> raiz (3 padrões independentes: caminho exato, *.env, **/*.env) — nunca foi commitado.",
+        "Nenhuma chave (Alpaca, Alchemy) aparece em texto plano em nenhum log, evento do EventBus ou resposta do dashboard — só os módulos que as leem diretamente do ambiente têm acesso.",
+        "Todas as chaves em uso são de contas de <b>paper trading</b> (Alpaca) ou de nível gratuito somente-leitura de dado público (Alchemy) — nenhuma tem permissão de mover fundos reais, mesmo que vazasse.",
+        "Falha ao carregar uma chave é sempre fail-safe: o módulo correspondente cai pra observação/desativado (ver <font face='JetBrainsMono'>multi_asset.rs</font>), nunca opera com um valor inventado no lugar da chave ausente.",
+    ]))
+    story.append(callout_box(
+        "O que este checklist NÃO cobre ainda, porque não existe capital real conectado a nada: "
+        "rotação periódica de chave, alerta automático de uso anômalo, e o processo de revogação de "
+        "chave em caso de vazamento suspeito. Vira obrigatório antes da Fase 12 (Seção 10) — registrado "
+        "aqui como pré-requisito, não como lacuna do estágio atual (100% paper trading não tem chave "
+        "com poder de mover nada).",
+        border_color=GOLD, bg=GOLD_SOFT,
+    ))
 
     story.append(P("12.4 Kill-switch — em camadas (revisado 2x)", "H2"))
     story.append(P(
@@ -1337,34 +1418,70 @@ def build():
     ))
     story.append(Spacer(1, 4))
     story.append(callout_box(
-        "<b>Sobre \"cancelar ordens abertas\" (ponto levantado na revisão técnica):</b> o kill-switch "
-        "não neutraliza nem fecha posições abertas porque, no modelo de execução atual, NÃO EXISTE "
-        "posição aberta entre um ciclo e outro — toda ordem simulada é round-trip instantâneo (decide "
-        "e resolve no mesmo tick, ver Seção 3). Não é uma lacuna do kill-switch, é uma característica "
-        "honesta do estágio atual do sistema. Se/quando o modelo de execução passar a manter posições "
-        "reais abertas (o próximo passo natural do realismo de execução, Seção 12.5), o kill-switch "
-        "PRECISA ganhar lógica de neutralizar/fechar posição — registrado aqui como pré-requisito "
-        "explícito antes dessa mudança maior, não algo a esquecer.",
+        "<b>Sobre \"cancelar ordens abertas\" — ATUALIZADO 13/08/2026, o pré-requisito registrado "
+        "abaixo já aconteceu:</b> desde a correção de exposição simultânea real (Seção 12.5), posições "
+        "GENUINAMENTE ficam abertas entre o momento em que a ordem é aprovada e o momento em que a "
+        "janela real de <font face='JetBrainsMono'>expected_holding_secs</font> termina — deixou de "
+        "ser round-trip instantâneo. O kill-switch continua bloqueando só NOVAS aberturas "
+        "(<font face='JetBrainsMono'>orchestrator.rs</font>: a resolução de posições já abertas roda "
+        "incondicionalmente a cada tick, antes até da checagem de halt — de propósito, fechar o que já "
+        "está aberto não deveria depender do kill-switch estar ativo ou não). Isso significa que, se o "
+        "kill-switch disparar logo depois de várias posições abrirem, elas continuam correndo até o "
+        "prazo natural delas, não são neutralizadas na hora. Na prática a exposição é pequena e "
+        "curta — no máximo 30s (Order Flow) ou 2s (Arbitragem), as duas estratégias com volume real; "
+        "Pump Exhaustion tem janela de 20min mas ainda não executa nenhum trade (Seção 7). Gap real, "
+        "porém pequeno e limitado no tempo — registrado honestamente, não mais tratado como inaplicável.",
         border_color=RISK_RED, bg=colors.HexColor("#FBE9EC"),
     ))
 
-    story.append(P("12.5 Realismo de execução — parcialmente implementado", "H2"))
+    story.append(P("12.5 Realismo de execução e regras reais — auditoria de 13/08/2026", "H2"))
     story.append(P(
-        "Dos itens listados na Seção 3, dois agora estão simulados: preenchimento parcial de ordem "
-        "(fração aleatória do notional pedido em ~35% das execuções) e falha da segunda perna em "
-        "arbitragem (perna 1 executa, perna 2 falha — ~3% das execuções, tratado como perda no dobro "
-        "do <font face='JetBrainsMono'>max_loss_pct</font> sobre o notional pedido inteiro, não só o "
-        "preenchido). <b>Ainda faltam:</b> fila de ordens maker, rate limits, clock drift, "
-        "reconciliação pós-desconexão, funding cobrado durante posição aberta — a lista completa "
-        "continua na Seção 3.", "Body"))
+        "Dos itens listados na Seção 3, dois já estavam simulados desde a revisão anterior: "
+        "preenchimento parcial de ordem (fração aleatória do notional pedido em ~35% das execuções) e "
+        "falha da segunda perna em arbitragem (perna 1 executa, perna 2 falha — ~3% das execuções, "
+        "tratado como perda no dobro do <font face='JetBrainsMono'>max_loss_pct</font> sobre o "
+        "notional pedido inteiro). Uma auditoria técnica externa mais recente (13/08/2026) perguntou "
+        "diretamente \"o que falta ainda pra ser 100% real em regras, validações e etc?\" — a resposta "
+        "revelou um problema estrutural mais sério do que qualquer item isolado da Seção 3: os mapas "
+        "de exposição por estratégia/grupo NUNCA recebiam valor diferente de zero em lugar nenhum do "
+        "código, porque toda posição resolvia no mesmo instante em que abria. Os gates de limite de "
+        "risco liam exposição sempre zerada — nunca bloqueavam por excesso SIMULTÂNEO, só um trade "
+        "grande demais sozinho.", "Body"))
+    story.append(bullets([
+        "<b>Exposição simultânea real</b> — posições agora abrem e ficam genuinamente reservadas até a janela real de <font face='JetBrainsMono'>expected_holding_secs</font> terminar (30s Order Flow, 2s Arbitragem, 20min Pump Exhaustion), não mais round-trip instantâneo. Ver Seção 12.4 sobre o que isso muda no kill-switch.",
+        "<b>Rate limiter real por venue</b> — token bucket (8 requisições/s, mesmo padrão de uma conta de varejo comum), consumido só quando uma ordem é de fato aberta.",
+        "<b>Notional mínimo real por símbolo</b> — buscado ao vivo da própria API pública da exchange no boot (Bybit <font face='JetBrainsMono'>instruments-info</font>, Bitget <font face='JetBrainsMono'>spot/public/symbols</font> — 555 e 1.262 símbolos respectivamente); ordem abaixo do mínimo real é rejeitada.",
+        "<b>Taxas corrigidas</b> — Bitget taker 0,10%-&gt;0,20% (verificado ao vivo na API pública), Bybit maker 0,08%-&gt;0,10% (taxa publicada padrão não-VIP, já que a conta real nunca teve desconto confirmado), Pump Exhaustion ganhou taxa taker (2&#215;0,055%) que antes não descontava NENHUMA taxa do edge medido.",
+        "<b>Reamostragem por bootstrap</b> — Order Flow, Arbitragem e Pump Exhaustion agora sorteiam o resultado de cada trade a partir de um desfecho REAL já confirmado contra preço (histórico de confirmação), não de uma fórmula confidence&#215;net_edge.",
+        "<b>Deduplicação de sinais sobrepostos</b> — janelas de confirmação sobrepostas do mesmo símbolo (autocorrelação) não contam mais como amostras independentes: só uma confirmação em voo por símbolo por vez.",
+        "<b>Kelly com limite inferior de confiança</b> — a taxa de acerto usada no cálculo de Kelly deixou de ser o valor pontual (que superestima em amostra pequena) e passou a ser o limite inferior de Wilson (95% de confiança).",
+        "<b>Normalização entre símbolos</b> — o Kelly hierárquico por símbolo (Seção 9.3) agora normaliza contra a média dos pares da mesma estratégia, pra vários símbolos não reivindicarem 2,00x cada SIMULTANEAMENTE.",
+        "<b>Gate de escalonamento por evidência</b> — crescer a perna agora também exige orçamento de risco livre (não estar usando &gt;50% do limite da estratégia) e diversidade de símbolos (lucro vindo de pelo menos 2 símbolos distintos), além dos critérios já existentes (Seção 9.1).",
+        "<b>Teto global de alavancagem e trava do Launch Radar</b> — ver Seção 9 (tabela de parâmetros) e Seção 9.1.",
+    ]))
     story.append(callout_box(
-        "<b>Honestidade sobre esses números (revisão técnica externa):</b> 35% e 3% são estimativas "
-        "arbitrárias, não calibradas contra latência, rejeição ou preenchimento reais — o roadmap já "
-        "dizia isso desde a primeira versão, mas vale repetir aqui com todas as letras: nenhum desses "
-        "dois números veio de dado medido. Diferente do net_edge do Pump Exhaustion (Seção 2.1), que "
-        "agora É calibrado por confirmação real, estes continuam placeholder. Calibrá-los exigiria "
-        "execução real (não paper trading) ou uma fonte externa de latência/book de nível institucional "
-        "— nenhuma das duas disponível nesta fase.",
+        "<b>Achado ao vivo durante a verificação (não fazia parte da auditoria original):</b> KUBUSDT "
+        "mostrava \"100% de acerto\" com o MESMO edge repetido em toda confirmação — investigação do "
+        "log bruto revelou que o book da Bitget tinha parado de atualizar por 8+ minutos enquanto o da "
+        "Bybit continuava normal. Não era vantagem real, era um preço morto sendo tratado como cotação "
+        "executável. <font face='JetBrainsMono'>TopOfBook</font> ganhou um timestamp de última "
+        "atualização; um book que não atualiza há mais de 30s agora é ignorado. O histórico de "
+        "confirmação contaminado por esse bug foi apagado e recalibrado do zero.",
+        border_color=RISK_RED, bg=colors.HexColor("#FBE9EC"),
+    ))
+    story.append(Spacer(1, 4))
+    story.append(P(
+        "<b>Ainda faltam</b> (lista completa continua na Seção 3): fila de ordens maker, clock drift, "
+        "reconciliação pós-desconexão, funding cobrado durante posição aberta. Rate limits e notional "
+        "mínimo real, que apareciam nessa lista em revisões anteriores, foram implementados nesta "
+        "auditoria e saíram dela.", "Body"))
+    story.append(callout_box(
+        "<b>Honestidade sobre os dois números de preenchimento parcial/falha de perna:</b> 35% e 3% "
+        "continuam sendo estimativas arbitrárias, não calibradas contra latência, rejeição ou "
+        "preenchimento reais — diferente de tudo que foi corrigido nesta revisão, que veio de dado "
+        "medido ou de API pública verificada. Calibrar esses dois exigiria execução real (não paper "
+        "trading) ou uma fonte externa de latência/book de nível institucional — nenhuma das duas "
+        "disponível nesta fase.",
         border_color=GOLD, bg=GOLD_SOFT,
     ))
     story.append(Spacer(1, 4))
@@ -1403,15 +1520,22 @@ def build():
         "visíveis na Visão Geral sem precisar abrir cada aba — decisão direta da análise desta revisão "
         "de que profit factor por estratégia importa mais que olhar só o win rate agregado do sistema.", "Body"))
 
-    story.append(P("12.9 Amostragem independente e universo de símbolos (4ª revisão, 12/08/2026)", "H2"))
-    story.append(P(
-        "<b>Pump Exhaustion contava o mesmo evento várias vezes:</b> achado correto da revisão — um "
-        "pump sustentado por minutos gerava \"sinal true\" em várias janelas de scan seguidas, e cada "
-        "uma virava uma amostra nova na confirmation_history, mesmo sendo o mesmo evento observado "
-        "repetidamente, não eventos independentes. Corrigido em duas frentes: (1) um símbolo não "
-        "registra nova confirmação enquanto já tiver uma pendente (ainda dentro da janela de 20min); "
-        "(2) o cooldown por símbolo subiu de 45s para 30min. Combinado, um símbolo só contribui uma "
-        "amostra nova a cada ~50min no mínimo — 20min de janela + 30min de descanso.", "Body"))
+    # KeepTogether (polimento visual, 13/08/2026): esta secao ficou orfa em
+    # revisoes anteriores — o titulo sozinho no fim de uma pagina, com o
+    # paragrafo que o segue empurrado pra pagina seguinte. Titulo + primeiro
+    # paragrafo agora sao um bloco atomico pro paginador, nunca mais quebram
+    # separados.
+    story.append(KeepTogether([
+        P("12.9 Amostragem independente e universo de símbolos (4ª revisão, 12/08/2026)", "H2"),
+        P(
+            "<b>Pump Exhaustion contava o mesmo evento várias vezes:</b> achado correto da revisão — um "
+            "pump sustentado por minutos gerava \"sinal true\" em várias janelas de scan seguidas, e cada "
+            "uma virava uma amostra nova na confirmation_history, mesmo sendo o mesmo evento observado "
+            "repetidamente, não eventos independentes. Corrigido em duas frentes: (1) um símbolo não "
+            "registra nova confirmação enquanto já tiver uma pendente (ainda dentro da janela de 20min); "
+            "(2) o cooldown por símbolo subiu de 45s para 30min. Combinado, um símbolo só contribui uma "
+            "amostra nova a cada ~50min no mínimo — 20min de janela + 30min de descanso.", "Body"),
+    ]))
     story.append(P(
         "<b>Fase 11 ganhou exigência de distribuição temporal:</b> 150 operações (ou 20, pra Pump "
         "Exhaustion) todas na mesma semana não provam nada sobre regimes de mercado diferentes. "
@@ -1440,13 +1564,17 @@ def build():
         border_color=GOLD, bg=GOLD_SOFT,
     ))
 
-    story.append(PageBreak())
-    story.append(P("Apendice A — mapa resumido das fases historicas (v1)", "H1"))
-    story.append(P(
-        "A v1 deste documento organizava tudo em 13 fases sequenciais (Fase 0 a Fase 12). A Secao 2 "
-        "substitui isso por uma escada de maturidade independente por estrategia, mas os numeros de "
-        "fase continuam aparecendo em varios lugares do codigo e da conversa do projeto — este mapa "
-        "e so a referencia de continuidade, nao a estrutura principal do documento.", "Body"))
+    # PageBreak forcado removido (polimento visual, 13/08/2026) — mesmo
+    # raciocinio da Secao 2: deixava ~180pt de espaco vazio na pagina
+    # anterior. Titulo + primeiro paragrafo protegidos por KeepTogether.
+    story.append(KeepTogether([
+        P("Apendice A — mapa resumido das fases historicas (v1)", "H1"),
+        P(
+            "A v1 deste documento organizava tudo em 13 fases sequenciais (Fase 0 a Fase 12). A Secao 2 "
+            "substitui isso por uma escada de maturidade independente por estrategia, mas os numeros de "
+            "fase continuam aparecendo em varios lugares do codigo e da conversa do projeto — este mapa "
+            "e so a referencia de continuidade, nao a estrutura principal do documento.", "Body"),
+    ]))
     story.append(section_table([
         ["Fase", "Objetivo original", "Status atual"],
         ["0 — Nucleo do Orquestrador", "Tipos, motor de risco, loop de decisao", "§MONO§Concluida"],
