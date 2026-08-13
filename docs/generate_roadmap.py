@@ -385,13 +385,132 @@ def build():
     ))
     story.append(PageBreak())
 
-    # ---------------------------------------------------------------- Sec0
-    story.append(P("0. Regras que nao mudam, independente da fase", "H1"))
+    # ---------------------------------------------------- Guia Operacional
+    story.append(P("Guia operacional — como rodar e como o sistema funciona (13/08/2026)", "H1"))
+    story.append(P(
+        "Pedido direto do usuário: \"coloque tudo como faz para o sistema funcionar, como ele "
+        "funciona, como ele trabalha, quais os caminhos que ele segue, com quanto começa, o que é "
+        "necessário para fazer ele funcionar legal, se tudo é dado real e etc\". Esta seção responde "
+        "isso de forma direta e prática — complementa, não substitui, o restante do documento (que é "
+        "mais auditoria técnica que guia de uso).", "Body"))
+
+    story.append(P("Pré-requisitos e como rodar", "H2"))
+    story.append(P(
+        "Requisitos: toolchain Rust (<font face='JetBrainsMono'>cargo</font>) e acesso à internet "
+        "(o sistema não funciona offline — todas as 9 estratégias dependem de dado ao vivo real). "
+        "Nenhuma chave de API é obrigatória pra o sistema ligar — as que faltarem, os módulos "
+        "correspondentes caem em modo observação/desativado sozinhos, sem travar o resto.", "Body"))
+    story.append(section_table([
+        ["Passo", "Comando"],
+        ["1. Build (a partir da raiz do repositório)", "§MONO§cargo build --release"],
+        ["2. Executar (precisa ser de dentro de orchestrator/, onde fica config/risk.toml)", "§MONO§cd orchestrator && ../target/release/orchestrator.exe"],
+        ["3. Abrir o dashboard", "§MONO§http://127.0.0.1:7878"],
+    ], [280, 220]))
+    story.append(Spacer(1, 4))
+    story.append(bullets([
+        "<b>Variáveis de ambiente opcionais</b> (arquivo <font face='JetBrainsMono'>orchestrator/.env</font>, nunca versionado — Seção 12.2/12.3): <font face='JetBrainsMono'>AURUMOS_ETH_WS_URL</font>/<font face='JetBrainsMono'>AURUMOS_ETH_HTTP_URL</font> (Whale Watch e Launch Radar DEX — sem elas, cai num nó RPC público gratuito, mais lento mas funcional) e <font face='JetBrainsMono'>ALPACA_API_KEY_ID</font>/<font face='JetBrainsMono'>ALPACA_API_SECRET_KEY</font> (Multi-Asset — sem elas, o módulo fica idle, resto do sistema roda normal).",
+        "<b>Ollama local</b> (opcional, mas recomendado) — News Reactor usa <font face='JetBrainsMono'>llama3.2:3b</font> via <font face='JetBrainsMono'>http://localhost:11434</font> pra classificar filings da SEC. Sem o Ollama rodando, cai num fallback neutro determinístico (nunca inventa uma direção) — o módulo continua funcionando, só sem a classificação real.",
+        "<b>Kill-switch manual</b> — criar o arquivo <font face='JetBrainsMono'>orchestrator/data/KILL</font> (qualquer conteúdo) pausa novas execuções na hora; apagar retoma. Não cancela posições já abertas (Seção 12.4) — elas resolvem sozinhas no prazo natural (no máximo 30s hoje).",
+        "<b>Estado persistido</b> — equity, escalonamento por estratégia, histórico de eventos e histórico de confirmação de preço sobrevivem a um restart do processo (tudo salvo em <font face='JetBrainsMono'>orchestrator/data/</font>). Reiniciar não zera o progresso.",
+    ]))
+
+    story.append(P("Com quanto capital o sistema começa", "H2"))
+    story.append(P(
+        "US$ 200 de referência (<font face='JetBrainsMono'>total_equity_start</font> em risk.toml), "
+        "puramente simbólico — é paper trading, nenhum dólar real é movido. Cada estratégia começa com "
+        "uma perna (ordem) de US$ 25 e cresce ou encolhe sozinha a partir daí conforme o próprio "
+        "histórico (Seção 9.1: Kelly fracionário, hierarquia de profit factor). Nenhuma estratégia "
+        "pode arriscar mais que uma fração fixa do equity por vez — de 0,10% (Launch, o mais baixo) a "
+        "0,35% (Arbitragem) — e o risco simultâneo de TODAS somadas nunca passa de 0,50% do equity "
+        "total. A tabela completa de parâmetros está na Seção 9.", "Body"))
+
+    story.append(P("Como ele funciona — o caminho de uma decisão, do sinal ao resultado", "H2"))
+    story.append(P(
+        "Os 9 módulos (Seção 6) rodam em paralelo, cada um lendo seu próprio feed de dado real e "
+        "publicando candidatos (<font face='JetBrainsMono'>Opportunity</font>) num canal comum — nenhum "
+        "módulo decide sozinho se executa. Todo candidato passa pelo MESMO caminho, não importa a "
+        "estratégia de origem:", "Body"))
+    story.append(bullets([
+        "<b>1. Emissão</b> — o módulo mede o mercado real (spread, funding, liquidação, filing, calendário, book) e calcula <font face='JetBrainsMono'>net_edge</font> — só as 3 estratégias com camada de confirmação de preço (Arbitragem, Order Flow, Pump Exhaustion) conseguem ter <font face='JetBrainsMono'>net_edge &gt; 0</font>; as outras 6 emitem sempre 0.0 (informativas — ver tabela abaixo).",
+        "<b>2. Confluência</b> — se 2+ estratégias de preço real (as mesmas 3 acima) concordam no mesmo ativo na mesma janela, o candidato ganha um bônus de prioridade (nunca cria vantagem que não existia sozinha).",
+        "<b>3. Ranking</b> — <font face='JetBrainsMono'>score() = net_edge&#215;confidence &#247; max_loss_pct &#247; capital_needed &#247; horas_de_holding</font> ordena os candidatos pendentes; <font face='JetBrainsMono'>score &lt;= 0</font> nunca chega a ser avaliado pelo motor de risco (Seção 3.1 tem a ressalva de que isso é ranking, não aprovação).",
+        "<b>4. Gate de risco</b> (<font face='JetBrainsMono'>risk::evaluate</font>) — expiração, trava estrutural do Launch Radar, alavancagem por oportunidade e agregada (Seção 9), teto de drawdown, anti-martingale, limite por estratégia, limite total, grupo de correlação (um símbolo por vez), rate limit por venue, notional mínimo real da exchange. Qualquer rejeição aqui é logada com o motivo exato.",
+        "<b>5. Abertura</b> — se aprovado, a posição abre de verdade: exposição é reservada (Seção 12.5), uma ficha do rate limiter é consumida, e a posição fica genuinamente 'em voo' pela janela real (30s Order Flow, 2s Arbitragem, 20min Pump Exhaustion).",
+        "<b>6. Resolução</b> — quando a janela termina, o resultado é decidido por um desfecho REAL já confirmado contra preço (reamostragem por bootstrap do histórico de confirmação), não por sorteio matemático — ver Seção 12.5.",
+        "<b>7. Contabilidade e persistência</b> — PnL aplicado ao equity, reserva protegida separada (Seção 1.2), escalonamento da estratégia atualizado (Kelly, profit factor), tudo salvo em disco.",
+        "<b>8. Dashboard</b> — cada etapa emite um evento pro EventBus, transmitido ao vivo via WebSocket pro dashboard (<font face='JetBrainsMono'>http://127.0.0.1:7878</font>) e persistido em JSONL — nada fica só na memória do processo.",
+    ]))
+
+    story.append(P("Quais caminhos cada estratégia segue — quem executa de verdade e quem só observa", "H2"))
+    story.append(section_table([
+        ["Estratégia", "Caminho", "Dado real de origem"],
+        ["Arbitragem", "§MONO§Executa — confirmação real + reamostragem + taxa descontada", "Book Bybit + Bitget (spot)"],
+        ["Order Flow", "§MONO§Executa — confirmação real + reamostragem + taxa descontada", "Book Bybit (spot)"],
+        ["Pump Exhaustion", "§MONO§Executa (0 trades até agora — Seção 7) — mesmo padrão acima", "Funding + OI + liquidações Bybit (perpétuos)"],
+        ["Liquidation Hunter", "§MONO§Observação — reforça confiança do Pump Exhaustion", "allLiquidation da Bybit"],
+        ["Whale Watch", "§MONO§Observação — reforça confiança do Pump Exhaustion", "On-chain Ethereum (Transfer USDT/USDC)"],
+        ["Launch Radar (CEX+DEX)", "§MONO§Observação — trava estrutural adicional (Seção 9.1)", "Bybit instruments-info + PairCreated Uniswap V2"],
+        ["News Reactor", "§MONO§Observação — classificação real via Ollama local", "SEC EDGAR (filings 8-K ao vivo)"],
+        ["Macro Engine", "§MONO§Observação — calendário público", "FOMC/CPI/NFP oficiais"],
+        ["Multi-Asset", "§MONO§Observação — idle sem chave Alpaca", "Alpaca (IEX), 6 ações líquidas dos EUA"],
+    ], [110, 210, 175]))
+    story.append(Spacer(1, 4))
     story.append(callout_box(
-        "Estas regras valem para todas as fases e nao podem ser puladas para 'acelerar'. Elas existem "
-        "porque o objetivo e capital real, e capital real nao tolera atalhos.",
+        "\"Observação\" não é um eufemismo pra \"não funciona\" — é por desenho (Seção 0: \"toda "
+        "oportunidade de ouro é hipótese, não fato\"). Essas 6 estratégias medem e reportam dado real "
+        "de verdade, mas nunca arriscam capital sozinhas porque não têm (ainda) uma camada de "
+        "confirmação de preço que valide a vantagem numérica delas — comprovado em código, não só em "
+        "texto: <font face='JetBrainsMono'>net_edge=0.0</font> faz <font face='JetBrainsMono'>score()"
+        "</font> ser sempre zero, e <font face='JetBrainsMono'>pick_best()</font> descarta qualquer "
+        "candidato com score &lt;= 0 antes de chegar no motor de risco.",
+        border_color=GOLD, bg=GOLD_SOFT,
+    ))
+
+    story.append(P("Tudo é dado real?", "H2"))
+    story.append(P(
+        "Sim, com uma única exceção clara e intencional: a EXECUÇÃO é paper trading (nenhum dinheiro "
+        "real se move, regra permanente do projeto — Seção 10). Tudo que alimenta a decisão de operar "
+        "é real:", "Body"))
+    story.append(bullets([
+        "Preços, books e spreads — WebSocket ao vivo da Bybit e Bitget, sem simulação.",
+        "Funding rate, open interest e liquidações — feed público da Bybit (perpétuos).",
+        "Movimentação on-chain — nó Ethereum real (público ou Alchemy, conforme configurado).",
+        "Filings corporativos — SEC EDGAR ao vivo; classificação de direção via LLM real (Ollama local) ou fallback neutro (nunca inventado).",
+        "Calendário macro — datas oficiais do Fed/BLS, não estimadas.",
+        "Ações/ETFs — feed real da Alpaca (IEX) quando configurado.",
+        "Filtros de exchange (notional mínimo, taxa, rate limit) — buscados ao vivo da própria API pública da Bybit/Bitget, não valores chutados.",
+        "Resultado de cada trade executado — reamostrado de um desfecho que REALMENTE aconteceu, medido contra preço real, não sorteado por fórmula (Seção 12.5).",
+    ]))
+    story.append(callout_box(
+        "O que ainda NÃO é calibrado contra dado real (honestidade, não escondido): a fração de "
+        "preenchimento parcial de ordem (~35%) e a probabilidade de falha da segunda perna em "
+        "arbitragem (~3%) continuam estimativas arbitrárias — calibrá-las exigiria execução real ou "
+        "acesso a book/latência de nível institucional, nenhum dos dois disponível em paper trading "
+        "(Seção 12.5 tem o detalhe completo).",
         border_color=RISK_RED, bg=colors.HexColor("#FBE9EC"),
     ))
+
+    story.append(P("O que é necessário pra funcionar bem", "H2"))
+    story.append(bullets([
+        "<b>Rede estável</b> — todas as 9 estratégias dependem de conexão contínua (WebSocket pra 3 delas); quedas de conexão reconectam sozinhas (retry automático), mas geram lacuna no dado durante a queda.",
+        "<b>Tempo</b> — a vantagem numérica real de Arbitragem/Order Flow/Pump Exhaustion só existe depois de acumular amostra de confirmação (mínimo 30-50 desfechos reais medidos); não tem como acelerar isso artificialmente sem comprometer a validade da medição.",
+        "<b>Ollama rodando localmente</b> (opcional) — sem ele, News Reactor funciona mas sem classificação real de direção.",
+        "<b>Chaves da Alpaca/Alchemy</b> (opcionais) — sem elas, Multi-Asset fica idle e Whale Watch/Launch Radar DEX usam um nó público mais lento; nada trava, só fica mais limitado.",
+        "<b>Disco</b> — o histórico de eventos, logs brutos e histórico de confirmação crescem continuamente (<font face='JetBrainsMono'>orchestrator/data/</font>); não há rotação/limpeza automática ainda.",
+    ]))
+
+    # PageBreak forcado removido (polimento visual, 13/08/2026, mesmo
+    # raciocinio das outras 2 secoes ja corrigidas) — titulo+callout
+    # protegidos por KeepTogether pra nunca ficarem orfaos.
+    # ---------------------------------------------------------------- Sec0
+    story.append(KeepTogether([
+        P("0. Regras que nao mudam, independente da fase", "H1"),
+        callout_box(
+            "Estas regras valem para todas as fases e nao podem ser puladas para 'acelerar'. Elas existem "
+            "porque o objetivo e capital real, e capital real nao tolera atalhos.",
+            border_color=RISK_RED, bg=colors.HexColor("#FBE9EC"),
+        ),
+    ]))
     story.append(Spacer(1, 6))
     story.append(bullets([
         "<b>Nenhuma execucao automatica com dinheiro real iniciada pelo assistente.</b> O codigo pode ser escrito e testado ate o ponto de enviar ordens, mas a conexao com chaves de API reais e o disparo da primeira ordem real e sempre um ato manual do usuario. Redacao completa desta regra na Secao 10.",
@@ -705,15 +824,18 @@ def build():
         border_color=POSITIVE, bg=colors.HexColor("#E4F5EE"),
     ))
 
-    story.append(PageBreak())
-
+    # PageBreak forcado removido (polimento visual, 13/08/2026) — mesmo
+    # padrao aplicado as outras secoes: deixava mais de 600pt vazios quando
+    # a Secao 2 terminava cedo. Titulo+intro protegidos por KeepTogether.
     # --------------------------------------------------------- Sec3 (realismo)
-    story.append(P("3. Realismo de execucao — pre-requisito para qualquer avanco de estagio", "H1"))
-    story.append(P(
-        "A Fase 1 ja considera taxa maker/taker e profundidade de livro, mas isso nao e suficiente "
-        "para confiar no resultado do paper trading como preditor de resultado real. Nenhuma "
-        "estrategia deve subir de estagio na escada da Secao 2 sem que a simulacao de execucao "
-        "modele explicitamente:", "Body"))
+    story.append(KeepTogether([
+        P("3. Realismo de execucao — pre-requisito para qualquer avanco de estagio", "H1"),
+        P(
+            "A Fase 1 ja considera taxa maker/taker e profundidade de livro, mas isso nao e suficiente "
+            "para confiar no resultado do paper trading como preditor de resultado real. Nenhuma "
+            "estrategia deve subir de estagio na escada da Secao 2 sem que a simulacao de execucao "
+            "modele explicitamente:", "Body"),
+    ]))
     story.append(bullets([
         "Posicao na fila de ordens maker (nao assumir preenchimento imediato/instantaneo).",
         "Preenchimentos parciais — uma ordem pode fechar so uma fracao do notional pedido.",
