@@ -212,12 +212,21 @@ async fn main() -> anyhow::Result<()> {
     // (todos presentes na semente original) simplesmente NÃO EXISTEM como
     // par spot, então ficavam presos em 0 amostras pra sempre — não é
     // "ainda não mediu", é "nunca vai medir". Passa a usar o mesmo
-    // universo spot real que a arbitragem já usa (symbols_rx_spot) —
-    // símbolos que existem em ambos os mercados continuam alimentando o
-    // ranking linear normalmente (a maioria dos pares populares existe
-    // nos dois), só os que são exclusivos de perpétuo deixam de ser
-    // tentados à toa.
-    let mut order_flow = OrderFlowSource::new(symbols_rx_spot.clone(), bus.clone(), edge_scores.clone());
+    // universo spot real que a arbitragem já usa (symbols_rx_spot).
+    //
+    // Segunda correção (13/08/2026, achado pelo usuário: "porque tem perp
+    // nesse edge e não está operando?"): a correção acima trocou a LISTA de
+    // símbolos pra spot, mas o `EdgeScores` continuou sendo o `edge_scores`
+    // do universo LINEAR — Order Flow media spread real do book spot e
+    // gravava como se fosse edge de perpétuo, inflando o painel "Universo
+    // perpétuos" do dashboard com número real mas rotulado errado (nenhuma
+    // fonte mede spread de book de perpétuo de verdade; Pump
+    // Exhaustion/Liquidation Hunter usam funding/OI/liquidação, não
+    // spread). Agora usa `edge_scores_spot`, coerente com o book que
+    // realmente conecta — o ranking "proven" do universo LINEAR passa a
+    // ficar vazio (honesto: nada mede isso hoje) em vez de mostrar dado
+    // emprestado do spot.
+    let mut order_flow = OrderFlowSource::new(symbols_rx_spot.clone(), bus.clone(), edge_scores_spot.clone());
     let order_flow_handle = tokio::spawn(async move {
         if let Err(e) = order_flow.run(of_tx).await {
             tracing::error!(error = %e, "fonte de order flow encerrou com erro");

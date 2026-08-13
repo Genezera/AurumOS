@@ -940,7 +940,7 @@ function renderOverview() {
     <div class="grid2" style="margin-bottom:20px;">
       <div class="panel">
         <h2><span>Universo perpétuos — <span id="symbolUniverseCount-linear">carregando…</span></span></h2>
-        <p class="hint">Order Flow, Pump Exhaustion, Liquidation Hunter. Rotação a cada 15min: mede edge real por símbolo, mantém quem comprovou vantagem, explora candidatos novos de toda a Bybit linear por volume.</p>
+        <p class="hint">Pump Exhaustion, Liquidation Hunter (funding/OI/liquidação — não usam spread de book). Rotação a cada 15min por volume real da Bybit linear. A coluna de edge fica zerada por padrão: nenhuma fonte mede spread de book de perpétuo hoje (Order Flow, que fazia essa medição, opera no book spot — ver painel ao lado).</p>
         <div id="symbolUniverseList-linear"></div>
       </div>
       <div class="panel">

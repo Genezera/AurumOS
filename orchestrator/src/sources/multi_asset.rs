@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use chrono::{Datelike, Timelike, Weekday};
+use chrono_tz::America::New_York;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
@@ -23,6 +25,31 @@ const WATCHLIST: [&str; 6] = ["AAPL", "MSFT", "SPY", "QQQ", "NVDA", "TSLA"];
 const MOVE_THRESHOLD_PCT: f64 = 0.005; // 0.5%
 const WINDOW: Duration = Duration::from_secs(60);
 const EMIT_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Bolsa aberta (NYSE, horário regular) → silêncio de mais de 30s no feed é
+/// sinal real de conexão morta. Fora do horário, o feed IEX simplesmente não
+/// tem trade nenhum pra mandar — tratar isso como "morta" fazia o módulo
+/// reconectar a cada ~35s a noite inteira, todo santo dia, sem necessidade
+/// (achado ao revisar os logs em 12/08/2026). Não considera feriados da
+/// bolsa — simplificação aceitável: no pior caso, reconecta cedo demais um
+/// punhado de dias por ano, nunca tarde demais.
+fn market_hours_read_timeout() -> Duration {
+    const OPEN: Duration = Duration::from_secs(30);
+    const CLOSED: Duration = Duration::from_secs(20 * 60);
+
+    let now = chrono::Utc::now().with_timezone(&New_York);
+    if matches!(now.weekday(), Weekday::Sat | Weekday::Sun) {
+        return CLOSED;
+    }
+    let minute_of_day = now.hour() * 60 + now.minute();
+    let market_open = 9 * 60 + 30;
+    let market_close = 16 * 60;
+    if (market_open..market_close).contains(&minute_of_day) {
+        OPEN
+    } else {
+        CLOSED
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct PricePoint {
@@ -85,15 +112,15 @@ async fn run_once(key: &str, secret: &str, tx: &Sender<Opportunity>) -> anyhow::
 
     let mut history: HashMap<String, Vec<PricePoint>> = HashMap::new();
     let mut last_emitted: HashMap<String, Instant> = HashMap::new();
-    const READ_TIMEOUT: Duration = Duration::from_secs(30);
     let mut last_msg = Instant::now();
     let mut watchdog = tokio::time::interval(Duration::from_secs(5));
 
     loop {
         tokio::select! {
             _ = watchdog.tick() => {
-                if last_msg.elapsed() > READ_TIMEOUT {
-                    anyhow::bail!("nenhuma mensagem em {}s — conexão provavelmente morta", READ_TIMEOUT.as_secs());
+                let timeout = market_hours_read_timeout();
+                if last_msg.elapsed() > timeout {
+                    anyhow::bail!("nenhuma mensagem em {}s — conexão provavelmente morta", timeout.as_secs());
                 }
             }
             msg = stream.next() => {
