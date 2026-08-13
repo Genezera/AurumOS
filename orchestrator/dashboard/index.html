@@ -222,6 +222,14 @@
   .pulse-card .spark { display: block; width: 100%; height: 30px; margin: 4px 0 7px; }
   .pulse-card .stats { display: flex; justify-content: space-between; font-size: 10px; color: var(--grey); }
   .pulse-card .stats b { color: var(--text); font-family: var(--font-data); font-variant-numeric: tabular-nums; }
+  /* Card "dormente" — estratégias observacionais ou fora da janela de
+     disparo (Macro, Launch, Multi-Asset fora do pregão etc.): em vez de
+     forçar um gráfico vazio de PnL que não existe, mostra por que está
+     quieto agora e desde quando. */
+  .pulse-card .dormant-hint { font-size: 9.8px; color: var(--grey); line-height: 1.4; min-height: 30px; margin: 4px 0 7px; display: flex; align-items: center; }
+  .pulse-card .status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-right: 6px; background: var(--grey); }
+  .pulse-card .status-dot.live { background: var(--green); animation: pulse 1.8s ease-in-out infinite; }
+  .pulse-card .last-seen { font-size: 9px; color: var(--grey); opacity: 0.75; }
 
   .grid2 { display: grid; grid-template-columns: 1.5fr 1fr; gap: 16px; }
   @media (max-width: 980px) { .grid2 { grid-template-columns: 1fr; } }
@@ -920,7 +928,7 @@ function renderOverview() {
       </div>
       <div class="panel">
         <h2><span>Cockpit de risco</span></h2>
-        <p class="hint">As 4 camadas do kill-switch, com o quanto já foi consumido de cada limite.</p>
+        <p class="hint">Conectado ao drawdown real do portfólio (equity atual vs. pico), recalculado a cada ciclo — as barras mostram o quanto já foi consumido de cada limite de <code>risk.toml</code>. Quando uma barra vira vermelha e pulsa, aquela camada travou novas execuções.</p>
         <div id="riskCockpit"></div>
       </div>
     </div>
@@ -958,10 +966,10 @@ function renderOverview() {
         <div id="feed"></div>
       </div>
       <div class="panel">
-        <h2>Exposição por estratégia (risco aberto)</h2>
-        <p class="hint">Neste estágio (paper trading sintético) cada ordem fecha instantaneamente, então normalmente não há exposição aberta entre um snapshot e outro — isso passa a ser contínuo quando módulos reais com posições de verdade entrarem (Fases 1+ do roadmap).</p>
+        <h2>Risco por estratégia</h2>
+        <p class="hint">Cada ordem fecha instantaneamente neste estágio (paper trading), então "risco aberto" quase sempre mostra US$0 entre um snapshot e outro — não é falha, é o modelo de execução round-trip. As colunas de limite e perna são o que fica sempre visível e conectado de verdade a <code>risk.toml</code> e ao escalonamento por Kelly.</p>
         <table class="data" id="exposureTable">
-          <thead><tr><th>Estratégia</th><th>Risco aberto</th></tr></thead>
+          <thead><tr><th>Estratégia</th><th>Limite de risco</th><th>Perna atual</th><th>Risco aberto agora</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -1058,9 +1066,9 @@ function renderRiskCockpit() {
     tier('Rígido (diário)', snap.daily_drawdown_pct, cfg.daily_halt_pct, false) +
     tier('Semanal', snap.weekly_drawdown_pct, cfg.weekly_halt_pct, false) +
     tier('Total (desde o pico)', snap.drawdown_pct, cfg.total_drawdown_halt_pct, false) +
-    `<div class="cockpit-manual">
-      <span class="name">Manual (data/KILL)</span>
-      <span class="pill ${manualActive ? 'halt' : ''}">${manualActive ? 'ativo — bloqueado' : 'arquivo ausente'}</span>
+    `<div class="cockpit-manual" title="Parada de emergência acionada manualmente por quem opera o servidor — não por nenhuma regra automática de risco.">
+      <span class="name">Parada manual de emergência</span>
+      <span class="pill ${manualActive ? 'halt' : ''}">${manualActive ? '⛔ acionada — execuções pausadas' : '○ inativa'}</span>
     </div>`;
 }
 
@@ -1100,6 +1108,20 @@ function renderSymbolUniverse() {
   });
 }
 
+// Por que cada estratégia observacional fica quieta a maior parte do
+// tempo — explicado no card em vez de deixar um gráfico vazio parecendo
+// quebrado (pedido do usuário, 12/08/2026: "eu não sei no que ele está
+// conectado"). São fatos verificados sobre cada módulo, não um chute.
+const DORMANT_HINT = {
+  news: 'Observação — classifica notícias reais via LLM local, mas net_edge é sempre 0 por design (sem confirmação de preço ainda)',
+  launch: 'Dispara só quando um par NOVO é listado na Bybit — evento raro por natureza, não falha',
+  pump_exhaustion: 'Sinal ativo — net_edge só fica positivo após 20 confirmações de preço reais acumularem',
+  whale_watch: 'Observação — alimenta a fusão com Pump Exhaustion; net_edge sempre 0 por design',
+  macro: 'Dispara só numa janela de -5min/+15min ao redor de FOMC/CPI/NFP — dormente o resto do tempo',
+  liquidation_hunter: 'Observação — alimenta a fusão com Pump Exhaustion; net_edge sempre 0 por design',
+  multi_asset: 'Ativo só no horário de pregão de NY (9:30-16h ET) — reconecta em loop fora disso, não é falha',
+};
+
 function renderStrategyPulseGrid() {
   const grid = document.getElementById('pulseGrid');
   if (!grid) return;
@@ -1108,42 +1130,57 @@ function renderStrategyPulseGrid() {
     const total = s.wins + s.losses;
     const winRate = total > 0 ? (100 * s.wins / total) : null;
     const badgeCls = s.pnl > 0 ? 'pos' : s.pnl < 0 ? 'neg' : 'neutral';
-    const pnlLabel = total > 0 ? fmtUsd(s.pnl) : 'sem trades';
-    const pts = (s.markers.__pnlPoints || []).slice(-24).map(p => p.value);
-    const sparkColor = s.pnl > 0 ? '#25d695' : s.pnl < 0 ? '#ff4d67' : '#aab6c3';
+    const pnlLabel = total > 0 ? fmtUsd(s.pnl) : (s.received > 0 ? `${s.received} sinais` : 'sem atividade');
+    const hasTrades = total > 0;
+    const lastFeedItem = s.feed[s.feed.length - 1];
+    let body;
+    if (hasTrades) {
+      const pts = (s.markers.__pnlPoints || []).slice(-24).map(p => p.value);
+      const sparkColor = s.pnl > 0 ? '#25d695' : s.pnl < 0 ? '#ff4d67' : '#aab6c3';
+      body = sparklineSvg(pts, sparkColor);
+    } else {
+      const live = s.received > 0;
+      const hint = DORMANT_HINT[meta.key] || 'Observação — ainda sem sinais';
+      body = `<div class="dormant-hint"><span class="status-dot ${live ? 'live' : ''}"></span><span>${hint}</span></div>`;
+    }
     return `
       <div class="pulse-card" data-key="${meta.key}">
         <div class="head">
           <span class="name"><span class="icon">${STRATEGY_ICONS[meta.key] || ''}</span>${meta.label}</span>
           <span class="badge ${badgeCls}">${pnlLabel}</span>
         </div>
-        ${sparklineSvg(pts, sparkColor)}
+        ${body}
         <div class="stats">
           <span>win <b>${winRate === null ? '—' : winRate.toFixed(0) + '%'}</b></span>
           <span>sinais <b>${s.received}</b></span>
           <span>trades <b>${total}</b></span>
           <span>perna <b>${fmtUsd(s.legSize)}</b></span>
         </div>
+        ${lastFeedItem ? `<div class="last-seen">última atividade ${lastFeedItem.time}</div>` : ''}
       </div>`;
   }).join('');
 }
 
 function renderExposureTable() {
   const snap = state.latestSnapshot;
+  const cfg = state.riskConfig;
   const tbody = document.querySelector('#exposureTable tbody');
-  if (!tbody || !snap) return;
+  if (!tbody || !snap || !cfg) return;
   tbody.innerHTML = '';
-  const open = snap.exposure_by_strategy.filter(([, v]) => v > 0);
-  if (open.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="2" style="color:var(--grey)">nenhuma exposição aberta neste instante</td></tr>';
-  } else {
-    open.forEach(([k, v]) => {
-      const label = (STRAT_BY_KEY[k] || { label: k }).label;
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${label}</td><td class="num">${fmtUsd(v)}</td>`;
-      tbody.appendChild(tr);
-    });
-  }
+  const openByKey = Object.fromEntries(snap.exposure_by_strategy);
+  const limitByKey = Object.fromEntries(cfg.strategy_risk_pct);
+  STRATEGIES.forEach(meta => {
+    const s = state.perStrategy[meta.key];
+    const open = openByKey[meta.key] || 0;
+    const limitPct = limitByKey[meta.key];
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${meta.label}</td>
+      <td class="num">${limitPct != null ? fmtPct(limitPct) : '—'}</td>
+      <td class="num">${fmtUsd(s.legSize)}</td>
+      <td class="num" style="color:${open > 0 ? 'var(--gold)' : 'var(--grey)'}">${open > 0 ? fmtUsd(open) : '—'}</td>`;
+    tbody.appendChild(tr);
+  });
 }
 
 function updateStrategyKpis(key) {
