@@ -9,12 +9,11 @@ use std::time::{Duration, Instant};
 /// exemplo dado: "pump detectado + depósitos de whales em exchange +
 /// liquidações compradoras crescendo = candidato forte de exaustão".
 
-/// ---------------- Liquidation Hunter → quadro por símbolo ----------------
+// ---------------- Liquidation Hunter → quadro por símbolo ----------------
 
 #[derive(Debug, Clone, Copy)]
 pub struct LiquidationSignal {
     pub liquidated_longs: bool,
-    pub same_side_count: usize,
     pub at: Instant,
 }
 
@@ -24,16 +23,31 @@ pub fn new_liquidation_board() -> LiquidationBoard {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-pub fn record_cascade(board: &LiquidationBoard, symbol: &str, liquidated_longs: bool, same_side_count: usize) {
+pub fn record_cascade(
+    board: &LiquidationBoard,
+    symbol: &str,
+    liquidated_longs: bool,
+    _same_side_count: usize,
+) {
     if let Ok(mut map) = board.lock() {
-        map.insert(symbol.to_string(), LiquidationSignal { liquidated_longs, same_side_count, at: Instant::now() });
+        map.insert(
+            symbol.to_string(),
+            LiquidationSignal {
+                liquidated_longs,
+                at: Instant::now(),
+            },
+        );
     }
 }
 
 /// true se uma cascata de liquidação de LONGS (posições compradas forçadas
 /// a fechar) ocorreu pra esse símbolo dentro da janela — sinal clássico de
 /// pressão vendedora que reforça uma leitura de exaustão de alta.
-pub fn recent_long_liquidation_cascade(board: &LiquidationBoard, symbol: &str, within: Duration) -> bool {
+pub fn recent_long_liquidation_cascade(
+    board: &LiquidationBoard,
+    symbol: &str,
+    within: Duration,
+) -> bool {
     board
         .lock()
         .ok()
@@ -42,7 +56,7 @@ pub fn recent_long_liquidation_cascade(board: &LiquidationBoard, symbol: &str, w
         .unwrap_or(false)
 }
 
-/// ---------------- Whale Watch → quadro agregado de mercado ----------------
+// ---------------- Whale Watch → quadro agregado de mercado ----------------
 
 // Stablecoin não tem "símbolo" de trading igual par cripto — o sinal do
 // Whale Watch é de mercado geral (capital indo pra exchanges = pressão
@@ -65,12 +79,43 @@ pub fn new_whale_board() -> WhaleBoard {
 pub fn record_deposit(board: &WhaleBoard, amount_usd: f64) {
     let Ok(mut flow) = board.lock() else { return };
     flow.deposits.push_back((Instant::now(), amount_usd));
-    while flow.deposits.front().map(|(t, _)| t.elapsed() > WHALE_FLOW_WINDOW).unwrap_or(false) {
+    while flow
+        .deposits
+        .front()
+        .map(|(t, _)| t.elapsed() > WHALE_FLOW_WINDOW)
+        .unwrap_or(false)
+    {
         flow.deposits.pop_front();
     }
 }
 
 /// Total depositado em exchanges conhecidas dentro da janela recente.
 pub fn recent_deposit_pressure_usd(board: &WhaleBoard) -> f64 {
-    board.lock().ok().map(|flow| flow.deposits.iter().map(|(_, v)| v).sum()).unwrap_or(0.0)
+    let Ok(mut flow) = board.lock() else {
+        return 0.0;
+    };
+    while flow
+        .deposits
+        .front()
+        .map(|(t, _)| t.elapsed() > WHALE_FLOW_WINDOW)
+        .unwrap_or(false)
+    {
+        flow.deposits.pop_front();
+    }
+    flow.deposits.iter().map(|(_, v)| v).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_whale_deposits_are_pruned_when_read() {
+        let board = new_whale_board();
+        board.lock().unwrap().deposits.push_back((
+            Instant::now() - WHALE_FLOW_WINDOW - Duration::from_secs(1),
+            5_000_000.0,
+        ));
+        assert_eq!(recent_deposit_pressure_usd(&board), 0.0);
+    }
 }

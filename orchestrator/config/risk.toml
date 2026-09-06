@@ -1,13 +1,12 @@
 # Configuração de capital e risco do AurumOS.
-# Estes números vieram da conversa de planejamento inicial (base US$200,
-# US$100 em cada exchange) e são um PONTO DE PARTIDA para paper trading —
-# devem ser recalibrados com dados reais antes de qualquer uso com dinheiro.
+# Uma conta, uma corretora (Bybit), base US$200. Estes números são um ponto
+# de partida para shadow/Bybit Demo e precisam de validação fora da amostra.
 
 total_equity_start = 200.0
 
 # Fração do lucro de cada ciclo positivo que vai para reserva protegida
 # em vez de ser reinvestida no capital operacional. Vale para as
-# estratégias "contínuas" (Arbitragem, Order Flow) — ver Strategy::is_rare_event.
+# estratégia executora de microestrutura — ver Strategy::is_rare_event.
 protected_reserve_pct = 0.20
 reinvest_pct = 0.80
 
@@ -28,11 +27,12 @@ total_risk_pct = 0.0050
 
 # Kill-switch automático em camadas (Fase 12) — revisado após auditoria
 # técnica externa (13/08/2026): 5% diário era alto demais para microcapital.
-# Complementa, não substitui, o drawdown_halve_threshold_pct abaixo (que
-# reduz o tamanho da perna, mas por si só não para o sistema).
+# A proteção não-destrutiva contra drawdown hoje é o teto aplicado ao
+# tamanho EFETIVO da ordem (ver drawdown_ceiling_multiplier em risk.rs,
+# tiers fixos no código) — não o drawdown_halve_threshold_pct abaixo, que
+# não aciona mais nenhuma redução de perna (ver comentário dele).
 #
-# Preventivo: emite aviso no dashboard E reduz a perna pela metade (ver
-# orchestrator.rs, transição do aviso) — NÃO bloqueia novas execuções.
+# Preventivo: emite aviso no dashboard; não bloqueia novas execuções.
 daily_warn_pct = 0.01
 # Bloqueio rígido diário: para novas execuções até o dia seguinte (UTC) ou
 # até ser destravado manualmente (ver data/KILL). Reduzido de 2% para 1,5%
@@ -53,20 +53,18 @@ total_drawdown_halt_pct = 0.07
 # Risco máximo (capital em risco / equity total) que cada estratégia pode
 # ter aberto simultaneamente.
 [strategy_risk_pct]
-arbitrage = 0.0035
 order_flow = 0.0025
-news = 0.0015
-launch = 0.0010
-pump_exhaustion = 0.0025
-whale_watch = 0.0020
-macro = 0.0020
-liquidation_hunter = 0.0020
-multi_asset = 0.0015
 
 [leverage]
-# Nenhuma alavancagem em lançamentos de tokens (livro/liquidez não confiáveis).
+# Nenhuma alavancagem em lançamentos de tokens (livro/liquidez não
+# confiáveis). Histórico: chegou a ter uma trava própria e independente
+# (`RejectReason::NoLeverageOnLaunch`); Launch é ObservationOnly hoje e cai
+# no `ExecutionDisabled` genérico antes de chegar em qualquer checagem de
+# alavancagem, então esta chave só alimenta um valor de exibição no
+# dashboard (events.rs) — se Launch ganhar executor próprio no futuro, essa
+# trava independente deveria voltar em vez de confiar só no liquid_max abaixo.
 launch_max = 1.0
-# Alavancagem máxima em instrumentos líquidos (arbitragem, macro, order flow).
+# Alavancagem máxima em instrumentos líquidos. O executor atual usa 1x.
 liquid_max = 2.0
 # Teto global de alavancagem do PORTFÓLIO INTEIRO (task #89, auditoria
 # externa 13/08/2026) — soma do notional alavancado de TODAS as posições
@@ -83,7 +81,12 @@ global_max = 1.0
 min_cycles_between_scale = 50
 # Drawdown máximo (fração do pico de equity) permitido para autorizar escalonamento.
 max_drawdown_pct_for_scale = 0.02
-# Se o drawdown a partir do pico ultrapassar isso, a perna é reduzida pela metade.
+# Histórico: chegou a acionar redução de perna pela metade a cada trade em
+# drawdown, mas isso colapsava a perna até o piso e nunca recuperava
+# sozinho (auditoria externa, 12/08/2026 — ver comentário em risk.rs::
+# maybe_scale). Removido; hoje esta chave só alimenta um valor de exibição
+# no dashboard (events.rs) e não aciona nenhuma redução de perna — a
+# proteção de verdade é o teto não-destrutivo em drawdown_ceiling_multiplier.
 drawdown_halve_threshold_pct = 0.02
 # Fator de crescimento aplicado à perna quando as condições de escalonamento são atendidas.
 scale_growth_factor = 1.15

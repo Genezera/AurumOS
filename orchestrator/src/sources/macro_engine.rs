@@ -8,7 +8,7 @@ use tokio::time::{sleep, Duration};
 
 use crate::events::{DashboardEvent, EventBus, MacroCalendarEntry};
 use crate::sources::SignalSource;
-use crate::types::{Direction, Market, Opportunity, Strategy};
+use crate::types::{next_signal_id, Direction, ExecutionMode, Market, Opportunity, Strategy};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(30);
 // Janela em torno do horário oficial em que consideramos o evento "ao vivo".
@@ -71,9 +71,14 @@ impl SignalSource for MacroEngineSource {
 
     async fn run(&mut self, tx: Sender<Opportunity>) -> anyhow::Result<()> {
         let events = build_calendar();
-        tracing::info!(total_eventos = events.len(), "macro engine: calendário carregado (FOMC/CPI/NFP)");
+        tracing::info!(
+            total_eventos = events.len(),
+            "macro engine: calendário carregado (FOMC/CPI/NFP)"
+        );
         log_next_event_per_kind(&events);
-        self.bus.emit(DashboardEvent::macro_calendar(next_event_per_kind_for_dashboard(&events)));
+        self.bus.emit(DashboardEvent::macro_calendar(
+            next_event_per_kind_for_dashboard(&events),
+        ));
 
         let mut already_fired: HashSet<(usize, NaiveDate)> = HashSet::new();
 
@@ -81,7 +86,10 @@ impl SignalSource for MacroEngineSource {
             let now_et = chrono::Utc::now().with_timezone(&New_York);
 
             for (idx, event) in events.iter().enumerate() {
-                let Some(event_dt) = New_York.from_local_datetime(&event.date.and_time(event.time_et)).single() else {
+                let Some(event_dt) = New_York
+                    .from_local_datetime(&event.date.and_time(event.time_et))
+                    .single()
+                else {
                     continue;
                 };
                 // minutes_since_event < 0 significa que o evento ainda não
@@ -89,7 +97,8 @@ impl SignalSource for MacroEngineSource {
                 // passou. A janela cobre de WINDOW_BEFORE_MIN antes até
                 // WINDOW_AFTER_MIN depois do horário oficial.
                 let minutes_since_event = (now_et - event_dt).num_minutes();
-                let in_window = (-WINDOW_BEFORE_MIN..=WINDOW_AFTER_MIN).contains(&minutes_since_event);
+                let in_window =
+                    (-WINDOW_BEFORE_MIN..=WINDOW_AFTER_MIN).contains(&minutes_since_event);
 
                 if in_window && already_fired.insert((idx, event.date)) {
                     tracing::info!(
@@ -100,6 +109,7 @@ impl SignalSource for MacroEngineSource {
                     );
 
                     let opp = Opportunity {
+                        signal_id: next_signal_id(),
                         market: Market::Index,
                         strategy: Strategy::Macro,
                         asset: format!("{} — {}", event.kind.label(), event.date),
@@ -110,10 +120,12 @@ impl SignalSource for MacroEngineSource {
                         // Informativo (net_edge=0) — placeholder consistente com valid_for_ms.
                         expected_holding_secs: 90.0,
                         capital_needed: 10.0,
+                        reference_price: None,
                         max_loss_pct: 0.02,
                         leverage: 1.0,
                         correlation_group: "usd_macro".to_string(),
-                        sampled_return: None,
+                        execution_mode: ExecutionMode::ObservationOnly,
+                        capital_multiplier: 1.0,
                         emitted_at: Instant::now(),
                     };
                     let _ = tx.send(opp).await;
@@ -150,7 +162,7 @@ fn log_next_event_per_kind(events: &[MacroEvent]) {
             .min_by_key(|(_, dt)| *dt);
 
         if let Some((event, dt)) = next {
-            let minutes_until = (dt - now_et.clone()).num_minutes();
+            let minutes_until = (dt - now_et).num_minutes();
             tracing::info!(
                 evento = event.kind.label(),
                 data = %event.date,

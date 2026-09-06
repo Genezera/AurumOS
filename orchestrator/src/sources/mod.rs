@@ -1,9 +1,9 @@
-pub mod arbitrage;
 pub mod dex_launch_radar;
+pub mod funding_carry;
 pub mod launch_radar;
 pub mod liquidation_hunter;
 pub mod macro_engine;
-pub mod multi_asset;
+pub mod maker_entry_research;
 pub mod news_reactor;
 pub mod order_flow;
 pub mod pump_exhaustion;
@@ -14,7 +14,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::types::Opportunity;
 
-/// Contrato que todo módulo de dados (arbitragem, whale watch, news reactor,
+/// Contrato que todo módulo de dados (whale watch, news reactor,
 /// launch radar, etc.) precisa implementar para participar do AurumOS. Um
 /// módulo só emite `Opportunity`s no canal — nunca decide sozinho se executa.
 #[async_trait::async_trait]
@@ -28,9 +28,8 @@ pub trait SignalSource: Send {
     async fn run(&mut self, tx: Sender<Opportunity>) -> anyhow::Result<()>;
 }
 
-/// Bybit e Bitget mandam níveis de book como `[["preco", "quantidade"], ...]`
-/// em strings — pega só o melhor nível (primeiro do array). Compartilhado
-/// entre os módulos que leem book público das duas exchanges.
+/// A Bybit manda níveis de book como `[["preco", "quantidade"], ...]` em
+/// strings — pega só o melhor nível (primeiro do array).
 pub fn best_level(levels: Option<&Value>) -> Option<(f64, f64)> {
     let arr = levels?.as_array()?;
     let first = arr.first()?.as_array()?;

@@ -18,7 +18,7 @@ use crate::events::{DashboardEvent, EventBus, SymbolRanking};
 /// mantém os que comprovaram edge positivo recente, e usa o resto das
 /// vagas pra explorar candidatos novos vindos direto da lista completa de
 /// perpétuos USDT da Bybit — não uma lista fixa escolhida à mão.
-
+///
 const EDGE_HISTORY_CAP: usize = 500;
 // Pedido do usuário (12/08/2026): "quero que continue rápido, dinâmico,
 // acelerado... pesquise o mercado inteiro globalmente, uma pool
@@ -46,16 +46,8 @@ const BYBIT_TICKERS_URL_BASE: &str = "https://api.bybit.com/v5/market/tickers?ca
 // praticamente todo o mercado linear USDT líquido da exchange.
 const CANDIDATE_POOL_CAP: usize = 450;
 
-/// Uma instância de `run()` é um universo dinâmico completo (candidatos +
-/// rotação + persistência) pra UM mercado específico. Pedido do usuário
-/// (12/08/2026 — "estende essa mesma busca ampla pra arbitragem também"):
-/// arbitragem compara SPOT-vs-SPOT (Bybit x Bitget), não perpétuos — usar a
-/// mesma lista dinâmica que Order Flow/Pump Exhaustion/Liquidation Hunter
-/// usam (baseada em `category=linear`) faria arbitragem "explorar" símbolos
-/// que nem existem como par spot nas duas exchanges. Cada mercado roda sua
-/// própria instância de `run()`, com seu próprio `EdgeScores` (edge medido
-/// de verdade É diferente entre maker-spread de livro único e spread
-/// cross-exchange) e seu próprio arquivo de persistência.
+/// Universo dinâmico completo dos perpétuos USDT da Bybit: candidatos,
+/// rotação, histórico de edge e persistência.
 #[derive(Debug, Clone, Copy)]
 pub struct UniverseKind {
     pub bybit_category: &'static str,
@@ -75,15 +67,10 @@ pub struct UniverseKind {
 pub const LINEAR: UniverseKind = UniverseKind {
     bybit_category: "linear",
     persist_filename: "active_symbols.json",
-    edge_scores_filename: "edge_scores_linear.json",
+    // Não reutilizar rankings de modelos anteriores. A amostra v9 nasce
+    // somente do OFI dinâmico no relógio da exchange + negócios agressivos.
+    edge_scores_filename: "edge_scores_microstructure_v9.json",
     dashboard_kind: "linear",
-};
-
-pub const SPOT: UniverseKind = UniverseKind {
-    bybit_category: "spot",
-    persist_filename: "active_symbols_spot.json",
-    edge_scores_filename: "edge_scores_spot.json",
-    dashboard_kind: "spot",
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -148,7 +135,9 @@ fn load_edge_scores(filename: &str) -> HashMap<String, EdgeStats> {
 /// que alguns segundos de medição num restart abrupto.
 pub fn save_edge_scores(scores: &EdgeScores, filename: &str) {
     let Ok(map) = scores.lock() else { return };
-    let Ok(json) = serde_json::to_string(&*map) else { return };
+    let Ok(json) = serde_json::to_string(&*map) else {
+        return;
+    };
     let path = edge_scores_path(filename);
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -160,11 +149,17 @@ pub fn save_edge_scores(scores: &EdgeScores, filename: &str) {
 /// perpétuos USDT da Bybit (ordenada por volume 24h — filtro de liquidez
 /// mínima, não filtro de "achismo"), decide a lista ativa com base no edge
 /// medido de verdade, persiste em disco pra observabilidade, e avisa todo
-/// mundo que está escutando (Arbitragem, Order Flow, Pump Exhaustion,
-/// Liquidation Hunter) via `watch::Sender` — cada um reconecta sozinho com
+/// mundo que está escutando (Order Flow, Pump Exhaustion, Liquidation
+/// Hunter) via `watch::Sender` — cada um reconecta sozinho com
 /// a lista nova (mesmo caminho de reconexão que já existia pra erro de
 /// rede, só que disparado por uma mudança de lista em vez de uma queda).
-pub async fn run(kind: UniverseKind, scores: EdgeScores, tx: watch::Sender<Vec<String>>, seed: Vec<String>, bus: EventBus) {
+pub async fn run(
+    kind: UniverseKind,
+    scores: EdgeScores,
+    tx: watch::Sender<Vec<String>>,
+    seed: Vec<String>,
+    bus: EventBus,
+) {
     let mut exploration_cursor: usize = 0;
     let mut candidate_pool: Vec<String> = seed.clone();
     let mut first_round = true;
@@ -179,13 +174,21 @@ pub async fn run(kind: UniverseKind, scores: EdgeScores, tx: watch::Sender<Vec<S
         if let Ok(mut map) = scores.lock() {
             *map = restored;
         }
-        tracing::info!(simbolos = count, categoria = kind.bybit_category, "universo de símbolos: edge medido recuperado do disco");
+        tracing::info!(
+            simbolos = count,
+            categoria = kind.bybit_category,
+            "universo de símbolos: edge medido recuperado do disco"
+        );
     }
 
     loop {
         match fetch_candidate_pool(kind.bybit_category).await {
             Ok(list) if !list.is_empty() => {
-                tracing::info!(total = list.len(), categoria = kind.bybit_category, "universo de símbolos: lista de candidatos atualizada (Bybit, por volume 24h)");
+                tracing::info!(
+                    total = list.len(),
+                    categoria = kind.bybit_category,
+                    "universo de símbolos: lista de candidatos atualizada (Bybit, por volume 24h)"
+                );
                 candidate_pool = list;
             }
             Ok(_) => {
@@ -196,12 +199,26 @@ pub async fn run(kind: UniverseKind, scores: EdgeScores, tx: watch::Sender<Vec<S
             }
         }
 
-        let active = rotate(&scores, &candidate_pool, &seed, first_round, &mut exploration_cursor);
+        let active = rotate(
+            &scores,
+            &candidate_pool,
+            &seed,
+            first_round,
+            &mut exploration_cursor,
+        );
         first_round = false;
         persist(&active, &scores, kind.persist_filename);
         save_edge_scores(&scores, kind.edge_scores_filename);
-        tracing::info!(total = active.len(), categoria = kind.bybit_category, "universo de símbolos: rotação concluída");
-        bus.emit(DashboardEvent::symbol_universe(kind.dashboard_kind, active.len(), top_ranked(&active, &scores, 12)));
+        tracing::info!(
+            total = active.len(),
+            categoria = kind.bybit_category,
+            "universo de símbolos: rotação concluída"
+        );
+        bus.emit(DashboardEvent::symbol_universe(
+            kind.dashboard_kind,
+            active.len(),
+            top_ranked(&active, &scores, 12),
+        ));
         if tx.send(active.clone()).is_err() {
             tracing::warn!(categoria = kind.bybit_category, "universo de símbolos: nenhum consumidor ouvindo mais, encerrando tarefa de rotação");
             return;
@@ -220,7 +237,11 @@ pub async fn run(kind: UniverseKind, scores: EdgeScores, tx: watch::Sender<Vec<S
         while waited < ROTATION_INTERVAL {
             tokio::time::sleep(LIVE_REFRESH_INTERVAL).await;
             waited += LIVE_REFRESH_INTERVAL;
-            bus.emit(DashboardEvent::symbol_universe(kind.dashboard_kind, active.len(), top_ranked(&active, &scores, 12)));
+            bus.emit(DashboardEvent::symbol_universe(
+                kind.dashboard_kind,
+                active.len(),
+                top_ranked(&active, &scores, 12),
+            ));
         }
     }
 }
@@ -243,7 +264,17 @@ fn rotate(
         .collect();
     proven.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut active: Vec<String> = proven.iter().map(|(s, _)| s.clone()).collect();
+    // Reserva as vagas de exploração ANTES de preencher comprovados. No
+    // código anterior os exploratórios eram anexados após até 220
+    // comprovados e depois removidos por `truncate(220)`.
+    let proven_cap = TOTAL_TARGET.saturating_sub(MIN_EXPLORATION_SLOTS);
+    let proven_symbols: std::collections::HashSet<&str> =
+        proven.iter().map(|(symbol, _)| symbol.as_str()).collect();
+    let mut active: Vec<String> = proven
+        .iter()
+        .take(proven_cap)
+        .map(|(s, _)| s.clone())
+        .collect();
 
     // No primeiro ciclo (boot, sem histórico ainda) parte da lista atual
     // (antigo WIDE_SYMBOLS como semente) em vez de zerar a cobertura —
@@ -261,7 +292,7 @@ fn rotate(
     // categoria.
     if first_round {
         for s in seed {
-            if candidate_pool.contains(s) && !active.contains(s) {
+            if active.len() < proven_cap && candidate_pool.contains(s) && !active.contains(s) {
                 active.push(s.clone());
             }
         }
@@ -273,7 +304,7 @@ fn rotate(
     // comprovados, uma fatia continua girando por candidatos novos, e um
     // símbolo comprovado que piorar (janela móvel decai o mean) some
     // sozinho de `proven` no próximo ciclo, liberando espaço.
-    let exploration_needed = MIN_EXPLORATION_SLOTS.max(TOTAL_TARGET.saturating_sub(active.len()));
+    let exploration_needed = TOTAL_TARGET.saturating_sub(active.len());
     let mut added = 0;
     let mut idx = *exploration_cursor;
     let pool_len = candidate_pool.len().max(1);
@@ -282,7 +313,9 @@ fn rotate(
             break;
         }
         let candidate = &candidate_pool[idx % pool_len];
-        if !active.contains(candidate) {
+        // Um comprovado que ficou fora do top 170 não é exploração. Pular
+        // todos os comprovados garante 50 instrumentos realmente novos.
+        if !proven_symbols.contains(candidate.as_str()) && !active.contains(candidate) {
             active.push(candidate.clone());
             added += 1;
         }
@@ -290,7 +323,7 @@ fn rotate(
     }
     *exploration_cursor = idx % pool_len;
 
-    active.truncate(TOTAL_TARGET.max(active.len().min(TOTAL_TARGET + MIN_EXPLORATION_SLOTS)));
+    active.truncate(TOTAL_TARGET);
     active
 }
 
@@ -307,7 +340,11 @@ fn ranked_symbols(active: &[String], scores: &EdgeScores) -> Vec<SymbolRanking> 
             }
         })
         .collect();
-    ranked.sort_by(|a, b| b.mean_edge_pct.partial_cmp(&a.mean_edge_pct).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.mean_edge_pct
+            .partial_cmp(&a.mean_edge_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     ranked
 }
 
@@ -339,6 +376,10 @@ fn persist(active: &[String], scores: &EdgeScores, filename: &str) {
 /// uma lista escolhida à mão. Top CANDIDATE_POOL_CAP por volume vira o pool
 /// de candidatos pra exploração.
 async fn fetch_candidate_pool(category: &str) -> anyhow::Result<Vec<String>> {
+    let crypto_fee_rates = crate::exchange_filters::fetch_bybit_crypto_taker_fees().await;
+    if crypto_fee_rates.is_empty() {
+        anyhow::bail!("classificação de taxas cripto indisponível");
+    }
     let client = reqwest::Client::builder()
         .user_agent("AurumOS-ResearchBot/0.1")
         .timeout(Duration::from_secs(15))
@@ -357,7 +398,7 @@ async fn fetch_candidate_pool(category: &str) -> anyhow::Result<Vec<String>> {
         .iter()
         .filter_map(|item| {
             let symbol = item.get("symbol")?.as_str()?;
-            if !symbol.ends_with("USDT") {
+            if !symbol.ends_with("USDT") || !crypto_fee_rates.contains_key(symbol) {
                 return None;
             }
             let turnover: f64 = item.get("turnover24h")?.as_str()?.parse().ok()?;
@@ -367,4 +408,35 @@ async fn fetch_candidate_pool(category: &str) -> anyhow::Result<Vec<String>> {
     with_volume.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     with_volume.truncate(CANDIDATE_POOL_CAP);
     Ok(with_volume.into_iter().map(|(s, _)| s).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_keeps_fifty_real_exploration_slots() {
+        let scores = new_edge_scores();
+        {
+            let mut map = scores.lock().unwrap();
+            for index in 0..TOTAL_TARGET {
+                let mut stats = EdgeStats::default();
+                for _ in 0..MIN_SAMPLES_TO_TRUST {
+                    stats.record(0.001 + index as f64 / 1_000_000.0);
+                }
+                map.insert(format!("P{index}USDT"), stats);
+            }
+        }
+        let candidates: Vec<String> = (0..300).map(|i| format!("P{i}USDT")).collect();
+        let proven: std::collections::HashSet<String> =
+            (0..TOTAL_TARGET).map(|i| format!("P{i}USDT")).collect();
+        let mut cursor = 0;
+        let active = rotate(&scores, &candidates, &[], false, &mut cursor);
+        let exploration = active
+            .iter()
+            .filter(|symbol| !proven.contains(*symbol))
+            .count();
+        assert_eq!(active.len(), TOTAL_TARGET);
+        assert!(exploration >= MIN_EXPLORATION_SLOTS);
+    }
 }

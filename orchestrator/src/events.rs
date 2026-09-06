@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::risk::{PortfolioState, RiskConfig, ScaleDirection, ScaleEvent};
-use crate::types::{Opportunity, Strategy};
+use crate::types::{ExecutionBackend, Opportunity, Strategy};
 
 /// Tudo que o orquestrador transmite para o dashboard. Serializado como JSON
 /// com um campo `type` que identifica a variante — o frontend só precisa
@@ -16,16 +16,27 @@ use crate::types::{Opportunity, Strategy};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DashboardEvent {
+    #[serde(rename = "execution_backend")]
+    ExecutionBackend {
+        backend: String,
+        endpoint: String,
+        sends_orders: bool,
+    },
     #[serde(rename = "opportunity_received")]
     OpportunityReceived {
+        signal_id: u64,
+        market: String,
         strategy: String,
         asset: String,
+        direction: String,
         net_edge: f64,
         confidence: f64,
         capital_needed: f64,
     },
     #[serde(rename = "decision")]
     Decision {
+        #[serde(default)]
+        signal_id: u64,
         strategy: String,
         asset: String,
         approved: bool,
@@ -34,11 +45,26 @@ pub enum DashboardEvent {
     },
     #[serde(rename = "trade_result")]
     TradeResult {
+        #[serde(default)]
+        signal_id: u64,
         strategy: String,
         asset: String,
         outcome: String,
         pnl: f64,
         equity_after: f64,
+    },
+    /// Evidência do backend de execução ligada ao sinal original. `unfilled`
+    /// não altera PnL; `filled` informa quote, profundidade e latência.
+    #[serde(rename = "execution")]
+    Execution {
+        signal_id: u64,
+        strategy: String,
+        asset: String,
+        status: String,
+        filled_notional: f64,
+        return_pct: f64,
+        latency_ms: u64,
+        note: String,
     },
     #[serde(rename = "portfolio_snapshot")]
     PortfolioSnapshot {
@@ -98,18 +124,15 @@ pub enum DashboardEvent {
     /// Duas ou mais estratégias diferentes sinalizaram o mesmo ativo numa
     /// janela curta — o núcleo do que o roadmap pede ("orquestrador...
     /// vários métodos... se comunicando"). `price_confirmed` indica se pelo
-    /// menos duas das estratégias envolvidas vêm de preço/book real
-    /// (Arbitragem, Order Flow, Pump Exhaustion) — nesse caso o score da
-    /// oportunidade recebe um bônus ao decidir; caso contrário é só
-    /// contexto (ex.: Whale Watch coincidindo com algo), sem afetar a
-    /// decisão de risco.
+    /// menos duas estratégias envolvidas possuem executor cotado. Sensores
+    /// `ObservationOnly` aparecem como contexto, sem afetar a decisão.
     #[serde(rename = "confluence")]
     Confluence {
         symbol: String,
         strategies: Vec<String>,
         price_confirmed: bool,
     },
-    /// "Prova de vida" do escaneamento real: Arbitragem, Order Flow e Pump
+    /// "Prova de vida" do escaneamento real: Order Flow e Pump
     /// Exhaustion só emitem `opportunity_received` quando cruzam o limiar
     /// de edge — o que pode ficar em silêncio por muito tempo em mercado
     /// eficiente, dando a impressão de sistema parado quando na verdade
@@ -128,12 +151,18 @@ pub enum DashboardEvent {
     /// acima do limite configurado). Oportunidades continuam sendo
     /// observadas e visíveis, só a execução para.
     #[serde(rename = "system_halt")]
-    SystemHalt { halted: bool, reason: Option<String> },
+    SystemHalt {
+        halted: bool,
+        reason: Option<String>,
+    },
     /// Aviso preventivo do kill-switch em camadas (drawdown diário acima do
     /// nível de atenção mas ainda abaixo do bloqueio rígido) — não-bloqueante,
     /// só visibilidade. Ver risk.rs::kill_switch_reason.
     #[serde(rename = "risk_warning")]
-    RiskWarning { warning: bool, message: Option<String> },
+    RiskWarning {
+        warning: bool,
+        message: Option<String>,
+    },
     /// Calendário de eventos macro (Fase 7) — emitido uma vez no boot.
     /// Diferente dos outros módulos, o Macro Engine passa a maior parte do
     /// tempo sem emitir `opportunity_received` nenhum (só dispara perto do
@@ -148,10 +177,7 @@ pub enum DashboardEvent {
     /// agora e por quê, em vez de uma lista fixa invisível.
     #[serde(rename = "symbol_universe")]
     SymbolUniverse {
-        /// "linear" (perpétuos — Order Flow/Pump Exhaustion/Liquidation
-        /// Hunter) ou "spot" (Bybit spot x Bitget spot — Arbitragem). Cada
-        /// mercado tem seu próprio universo dinâmico independente (12/08/2026)
-        /// porque o edge medido e os pares disponíveis são diferentes entre eles.
+        /// "linear": perpétuos USDT da única venue executora, a Bybit.
         kind: String,
         total: usize,
         top: Vec<SymbolRanking>,
@@ -174,18 +200,42 @@ pub struct MacroCalendarEntry {
 }
 
 impl DashboardEvent {
+    pub fn execution_backend(backend: ExecutionBackend) -> Self {
+        match backend {
+            ExecutionBackend::Shadow => DashboardEvent::ExecutionBackend {
+                backend: "shadow".to_string(),
+                endpoint: "public market data".to_string(),
+                sends_orders: false,
+            },
+            ExecutionBackend::BybitDemo => DashboardEvent::ExecutionBackend {
+                backend: "bybit_demo".to_string(),
+                endpoint: "api-demo.bybit.com".to_string(),
+                sends_orders: true,
+            },
+        }
+    }
+
     pub fn opportunity_received(opp: &Opportunity) -> Self {
         DashboardEvent::OpportunityReceived {
+            signal_id: opp.signal_id,
+            market: opp.market.key().to_string(),
             strategy: opp.strategy.key().to_string(),
             asset: opp.asset.clone(),
+            direction: opp.direction.key().to_string(),
             net_edge: opp.net_edge,
             confidence: opp.confidence,
             capital_needed: opp.capital_needed,
         }
     }
 
-    pub fn decision_approved(strategy: Strategy, asset: &str, order_size: f64) -> Self {
+    pub fn decision_approved(
+        signal_id: u64,
+        strategy: Strategy,
+        asset: &str,
+        order_size: f64,
+    ) -> Self {
         DashboardEvent::Decision {
+            signal_id,
             strategy: strategy.key().to_string(),
             asset: asset.to_string(),
             approved: true,
@@ -194,8 +244,14 @@ impl DashboardEvent {
         }
     }
 
-    pub fn decision_rejected(strategy: Strategy, asset: &str, reason: String) -> Self {
+    pub fn decision_rejected(
+        signal_id: u64,
+        strategy: Strategy,
+        asset: &str,
+        reason: String,
+    ) -> Self {
         DashboardEvent::Decision {
+            signal_id,
             strategy: strategy.key().to_string(),
             asset: asset.to_string(),
             approved: false,
@@ -204,13 +260,76 @@ impl DashboardEvent {
         }
     }
 
-    pub fn trade_result(strategy: Strategy, asset: &str, won: bool, pnl: f64, equity_after: f64) -> Self {
+    pub fn trade_result(
+        signal_id: u64,
+        strategy: Strategy,
+        asset: &str,
+        won: bool,
+        pnl: f64,
+        equity_after: f64,
+    ) -> Self {
         DashboardEvent::TradeResult {
+            signal_id,
             strategy: strategy.key().to_string(),
             asset: asset.to_string(),
             outcome: if won { "win" } else { "loss" }.to_string(),
             pnl,
             equity_after,
+        }
+    }
+
+    pub fn execution_unfilled(signal_id: u64, strategy: Strategy, asset: &str, note: &str) -> Self {
+        DashboardEvent::Execution {
+            signal_id,
+            strategy: strategy.key().to_string(),
+            asset: asset.to_string(),
+            status: "unfilled".to_string(),
+            filled_notional: 0.0,
+            return_pct: 0.0,
+            latency_ms: 0,
+            note: note.to_string(),
+        }
+    }
+
+    pub fn execution_open_risk(
+        signal_id: u64,
+        strategy: Strategy,
+        asset: &str,
+        filled_notional: f64,
+        latency_ms: u64,
+        note: &str,
+    ) -> Self {
+        DashboardEvent::Execution {
+            signal_id,
+            strategy: strategy.key().to_string(),
+            asset: asset.to_string(),
+            status: "open_risk".to_string(),
+            filled_notional,
+            return_pct: 0.0,
+            latency_ms,
+            note: note.to_string(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execution_filled(
+        signal_id: u64,
+        strategy: Strategy,
+        asset: &str,
+        filled_notional: f64,
+        return_pct: f64,
+        latency_ms: u64,
+        note: &str,
+    ) -> Self {
+        DashboardEvent::Execution {
+            signal_id,
+            strategy: strategy.key().to_string(),
+            asset: asset.to_string(),
+            status: "filled".to_string(),
+            filled_notional,
+            return_pct,
+            latency_ms,
+            note: note.to_string(),
         }
     }
 
@@ -260,7 +379,12 @@ impl DashboardEvent {
         }
     }
 
-    pub fn scan_heartbeat(strategy: Strategy, symbols_watched: u32, best_symbol: &str, best_edge_pct: f64) -> Self {
+    pub fn scan_heartbeat(
+        strategy: Strategy,
+        symbols_watched: u32,
+        best_symbol: &str,
+        best_edge_pct: f64,
+    ) -> Self {
         DashboardEvent::ScanHeartbeat {
             strategy: strategy.key().to_string(),
             symbols_watched,
@@ -278,11 +402,17 @@ impl DashboardEvent {
     }
 
     pub fn system_halt(reason: Option<String>) -> Self {
-        DashboardEvent::SystemHalt { halted: reason.is_some(), reason }
+        DashboardEvent::SystemHalt {
+            halted: reason.is_some(),
+            reason,
+        }
     }
 
     pub fn risk_warning(message: Option<String>) -> Self {
-        DashboardEvent::RiskWarning { warning: message.is_some(), message }
+        DashboardEvent::RiskWarning {
+            warning: message.is_some(),
+            message,
+        }
     }
 
     pub fn macro_calendar(events: Vec<MacroCalendarEntry>) -> Self {
@@ -290,7 +420,11 @@ impl DashboardEvent {
     }
 
     pub fn symbol_universe(kind: &str, total: usize, top: Vec<SymbolRanking>) -> Self {
-        DashboardEvent::SymbolUniverse { kind: kind.to_string(), total, top }
+        DashboardEvent::SymbolUniverse {
+            kind: kind.to_string(),
+            total,
+            top,
+        }
     }
 
     pub fn risk_config(cfg: &RiskConfig) -> Self {
@@ -350,6 +484,7 @@ pub struct EventBus {
 }
 
 impl EventBus {
+    #[cfg(test)]
     pub fn new(cap: usize) -> Self {
         let (tx, _rx) = broadcast::channel(4096);
         let started_at_ms = SystemTime::now()

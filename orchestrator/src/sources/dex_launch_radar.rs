@@ -8,21 +8,24 @@ use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::sources::SignalSource;
-use crate::types::{Direction, Market, Opportunity, Strategy};
+use crate::types::{next_signal_id, Direction, ExecutionMode, Market, Opportunity, Strategy};
 
 // Mesma convenção de whale_watch.rs: gratuito por padrão, sem cadastro.
 // Exporte AURUMOS_ETH_WS_URL/AURUMOS_ETH_HTTP_URL (ex.: Alchemy) pra
 // escalar sem mudar código — criar a conta é passo exclusivo do usuário.
 fn eth_ws_url() -> String {
-    std::env::var("AURUMOS_ETH_WS_URL").unwrap_or_else(|_| "wss://ethereum-rpc.publicnode.com".to_string())
+    std::env::var("AURUMOS_ETH_WS_URL")
+        .unwrap_or_else(|_| "wss://ethereum-rpc.publicnode.com".to_string())
 }
 fn eth_http_url() -> String {
-    std::env::var("AURUMOS_ETH_HTTP_URL").unwrap_or_else(|_| "https://ethereum-rpc.publicnode.com".to_string())
+    std::env::var("AURUMOS_ETH_HTTP_URL")
+        .unwrap_or_else(|_| "https://ethereum-rpc.publicnode.com".to_string())
 }
 
 const UNISWAP_V2_FACTORY: &str = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f";
 // keccak256("PairCreated(address,address,address,uint256)")
-const PAIR_CREATED_TOPIC: &str = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0f";
+const PAIR_CREATED_TOPIC: &str =
+    "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9";
 
 // keccak256("Transfer(address,address,uint256)") — mesma assinatura padrão
 // ERC-20 usada em whale_watch.rs, duplicada aqui (constante, não vale a
@@ -111,7 +114,11 @@ async fn run_once(tx: &Sender<Opportunity>) -> anyhow::Result<()> {
         "params": ["logs", { "address": UNISWAP_V2_FACTORY, "topics": [PAIR_CREATED_TOPIC] }]
     });
     futures_util::SinkExt::send(&mut sink, WsMessage::Text(sub.to_string())).await?;
-    tracing::info!(chain = "ethereum_mainnet", factory = UNISWAP_V2_FACTORY, "dex launch radar: assinatura de PairCreated enviada");
+    tracing::info!(
+        chain = "ethereum_mainnet",
+        factory = UNISWAP_V2_FACTORY,
+        "dex launch radar: assinatura de PairCreated enviada"
+    );
 
     let client = reqwest::Client::builder()
         .user_agent("AurumOS-ResearchBot/0.1")
@@ -124,7 +131,10 @@ async fn run_once(tx: &Sender<Opportunity>) -> anyhow::Result<()> {
         let msg = match next {
             Ok(Some(m)) => m,
             Ok(None) => anyhow::bail!("stream do nó encerrou"),
-            Err(_) => anyhow::bail!("nenhuma mensagem do nó em {}s — tratando como conexão morta", READ_TIMEOUT.as_secs()),
+            Err(_) => anyhow::bail!(
+                "nenhuma mensagem do nó em {}s — tratando como conexão morta",
+                READ_TIMEOUT.as_secs()
+            ),
         };
         match msg? {
             WsMessage::Text(text) => handle_message(&text, &client, tx).await,
@@ -156,26 +166,47 @@ async fn handle_message(text: &str, client: &reqwest::Client, tx: &Sender<Opport
     let token1 = extract_address(topics.get(2));
     // O campo `data` (não indexado) traz o endereço do par recém-criado nos
     // primeiros 32 bytes.
-    let Some(pair) = decode_address_from_data(data, 0) else { return };
-
-    let known = [WETH, USDC, USDT];
-    let (paired_with, new_token, new_token_is_token0) = if known.iter().any(|k| k.eq_ignore_ascii_case(&token0)) {
-        (token0.clone(), token1.clone(), false)
-    } else if known.iter().any(|k| k.eq_ignore_ascii_case(&token1)) {
-        (token1.clone(), token0.clone(), true)
-    } else {
-        // Par não envolve WETH/USDC/USDT — ignoramos (par entre dois
-        // tokens obscuros raramente é onde o volume de verdade aparece
-        // primeiro).
+    let Some(pair) = decode_address_from_data(data, 0) else {
         return;
     };
 
-    let creation_block = log.get("blockNumber").and_then(Value::as_str).and_then(|s| parse_hex_u64(s));
-    tracing::info!(new_token, pair, paired_with, ?creation_block, "novo par Uniswap V2 detectado — rodando checklist");
+    let known = [WETH, USDC, USDT];
+    let (paired_with, new_token, new_token_is_token0) =
+        if known.iter().any(|k| k.eq_ignore_ascii_case(&token0)) {
+            (token0.clone(), token1.clone(), false)
+        } else if known.iter().any(|k| k.eq_ignore_ascii_case(&token1)) {
+            (token1.clone(), token0.clone(), true)
+        } else {
+            // Par não envolve WETH/USDC/USDT — ignoramos (par entre dois
+            // tokens obscuros raramente é onde o volume de verdade aparece
+            // primeiro).
+            return;
+        };
 
-    let checklist = run_checklist(client, &new_token, &pair, new_token_is_token0, &paired_with, creation_block).await;
+    let creation_block = log
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(parse_hex_u64);
+    tracing::info!(
+        new_token,
+        pair,
+        paired_with,
+        ?creation_block,
+        "novo par Uniswap V2 detectado — rodando checklist"
+    );
+
+    let checklist = run_checklist(
+        client,
+        &new_token,
+        &pair,
+        new_token_is_token0,
+        &paired_with,
+        creation_block,
+    )
+    .await;
 
     let opp = Opportunity {
+        signal_id: next_signal_id(),
         market: Market::Crypto,
         strategy: Strategy::Launch,
         asset: format!("{new_token} — {}", checklist.summary()),
@@ -186,10 +217,12 @@ async fn handle_message(text: &str, client: &reqwest::Client, tx: &Sender<Opport
         // Informativo (net_edge=0) — placeholder consistente com valid_for_ms.
         expected_holding_secs: 300.0,
         capital_needed: 10.0,
+        reference_price: None,
         max_loss_pct: 0.02,
         leverage: 1.0,
         correlation_group: "new_listings".to_string(),
-        sampled_return: None,
+        execution_mode: ExecutionMode::ObservationOnly,
+        capital_multiplier: 1.0,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;
@@ -219,9 +252,15 @@ struct Checklist {
 
 impl Checklist {
     fn summary(&self) -> String {
-        let mint = if self.has_mint_selector { "mint: presente" } else { "mint: não detectado" };
+        let mint = if self.has_mint_selector {
+            "mint: presente"
+        } else {
+            "mint: não detectado"
+        };
         let owner = match &self.owner {
-            Some(o) if o == "0x0000000000000000000000000000000000000000" => "owner: renunciado".to_string(),
+            Some(o) if o == "0x0000000000000000000000000000000000000000" => {
+                "owner: renunciado".to_string()
+            }
             Some(o) => format!("owner: ativo ({}...)", &o[..10.min(o.len())]),
             None => "owner: n/d".to_string(),
         };
@@ -239,7 +278,10 @@ impl Checklist {
             None => "LP: n/d".to_string(),
         };
         let sybil = match &self.sybil_candidate {
-            Some((source, count)) => format!(", ⚠ possível distribuição coordenada ({count} carteiras via {}...)", &source[..10.min(source.len())]),
+            Some((source, count)) => format!(
+                ", ⚠ possível distribuição coordenada ({count} carteiras via {}...)",
+                &source[..10.min(source.len())]
+            ),
             None => String::new(),
         };
         format!("{mint}, {owner}, {liq}, {holders}, {lp}{sybil}")
@@ -270,10 +312,18 @@ async fn run_checklist(
             let reserve0 = hex.get(0..64).and_then(parse_hex_u128).unwrap_or(0);
             let reserve1 = hex.get(64..128).and_then(parse_hex_u128).unwrap_or(0);
             let raw_amount = if token_is_token0 { reserve1 } else { reserve0 };
-            let (decimals, symbol): (u32, &'static str) = if paired_with.eq_ignore_ascii_case(WETH) {
+            let (decimals, symbol): (u32, &'static str) = if paired_with.eq_ignore_ascii_case(WETH)
+            {
                 (18, "ETH")
             } else {
-                (6, if paired_with.eq_ignore_ascii_case(USDT) { "USDT" } else { "USDC" })
+                (
+                    6,
+                    if paired_with.eq_ignore_ascii_case(USDT) {
+                        "USDT"
+                    } else {
+                        "USDC"
+                    },
+                )
             };
             let amount = raw_amount as f64 / 10f64.powi(decimals as i32);
             (Some(amount), symbol)
@@ -292,7 +342,16 @@ async fn run_checklist(
 
     let lp_burned_pct = lp_burned_percentage(client, pair).await;
 
-    Checklist { has_mint_selector, owner, liquidity_native, liquidity_symbol, top_holder_pct, top5_holder_pct, lp_burned_pct, sybil_candidate }
+    Checklist {
+        has_mint_selector,
+        owner,
+        liquidity_native,
+        liquidity_symbol,
+        top_holder_pct,
+        top5_holder_pct,
+        lp_burned_pct,
+        sybil_candidate,
+    }
 }
 
 /// % do LP token do par (o próprio contrato do par, que segue ERC-20) que
@@ -300,17 +359,39 @@ async fn run_checklist(
 /// nunca mostra um número inventado.
 async fn lp_burned_percentage(client: &reqwest::Client, pair: &str) -> Option<f64> {
     let total_supply_raw = eth_call(client, pair, SELECTOR_TOTAL_SUPPLY).await?;
-    let total_supply = parse_hex_u128(total_supply_raw.strip_prefix("0x").unwrap_or(&total_supply_raw))?;
+    let total_supply = parse_hex_u128(
+        total_supply_raw
+            .strip_prefix("0x")
+            .unwrap_or(&total_supply_raw),
+    )?;
     if total_supply == 0 {
         return None;
     }
 
-    let dead_balance_data = format!("{SELECTOR_BALANCE_OF}000000000000000000000000{}", &BURN_ADDRESS_DEAD[2..]);
-    let zero_balance_data = format!("{SELECTOR_BALANCE_OF}000000000000000000000000{}", &BURN_ADDRESS_ZERO[2..]);
-    let dead_raw = eth_call_raw(client, "eth_call", serde_json::json!([{ "to": pair, "data": format!("0x{dead_balance_data}") }, "latest"])).await?;
-    let zero_raw = eth_call_raw(client, "eth_call", serde_json::json!([{ "to": pair, "data": format!("0x{zero_balance_data}") }, "latest"])).await?;
-    let dead_balance = parse_hex_u128(dead_raw.strip_prefix("0x").unwrap_or(&dead_raw)).unwrap_or(0);
-    let zero_balance = parse_hex_u128(zero_raw.strip_prefix("0x").unwrap_or(&zero_raw)).unwrap_or(0);
+    let dead_balance_data = format!(
+        "{SELECTOR_BALANCE_OF}000000000000000000000000{}",
+        &BURN_ADDRESS_DEAD[2..]
+    );
+    let zero_balance_data = format!(
+        "{SELECTOR_BALANCE_OF}000000000000000000000000{}",
+        &BURN_ADDRESS_ZERO[2..]
+    );
+    let dead_raw = eth_call_raw(
+        client,
+        "eth_call",
+        serde_json::json!([{ "to": pair, "data": format!("0x{dead_balance_data}") }, "latest"]),
+    )
+    .await?;
+    let zero_raw = eth_call_raw(
+        client,
+        "eth_call",
+        serde_json::json!([{ "to": pair, "data": format!("0x{zero_balance_data}") }, "latest"]),
+    )
+    .await?;
+    let dead_balance =
+        parse_hex_u128(dead_raw.strip_prefix("0x").unwrap_or(&dead_raw)).unwrap_or(0);
+    let zero_balance =
+        parse_hex_u128(zero_raw.strip_prefix("0x").unwrap_or(&zero_raw)).unwrap_or(0);
 
     Some(100.0 * (dead_balance + zero_balance) as f64 / total_supply as f64)
 }
@@ -332,14 +413,19 @@ struct TransferAnalysis {
 /// criação do par — viável sem indexador pago justamente porque é
 /// recém-lançado: poucos blocos de histórico). Campos `None` quando a
 /// consulta falha ou não há dado suficiente — nunca inventa um número.
-async fn analyze_transfers(client: &reqwest::Client, token: &str, from_block: u64) -> Option<TransferAnalysis> {
+async fn analyze_transfers(
+    client: &reqwest::Client,
+    token: &str,
+    from_block: u64,
+) -> Option<TransferAnalysis> {
     let params = serde_json::json!([{
         "address": token,
         "topics": [TRANSFER_TOPIC],
         "fromBlock": format!("0x{from_block:x}"),
         "toBlock": "latest",
     }]);
-    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs", "params": params });
+    let body =
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs", "params": params });
     let resp = client.post(eth_http_url()).json(&body).send().await.ok()?;
     let json: Value = resp.json().await.ok()?;
     let logs = json.get("result").and_then(Value::as_array)?;
@@ -350,20 +436,30 @@ async fn analyze_transfers(client: &reqwest::Client, token: &str, from_block: u6
     let mut fan_out: HashMap<String, HashMap<String, i128>> = HashMap::new();
 
     for log in logs {
-        let Some(topics) = log.get("topics").and_then(Value::as_array) else { continue };
+        let Some(topics) = log.get("topics").and_then(Value::as_array) else {
+            continue;
+        };
         if topics.len() < 3 {
             continue;
         }
         let from = extract_address(topics.get(1));
         let to = extract_address(topics.get(2));
-        let Some(data) = log.get("data").and_then(Value::as_str) else { continue };
-        let Some(amount) = parse_hex_u128(data.strip_prefix("0x").unwrap_or(data)) else { continue };
+        let Some(data) = log.get("data").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(amount) = parse_hex_u128(data.strip_prefix("0x").unwrap_or(data)) else {
+            continue;
+        };
         let amount = amount as i128;
 
         // Zero address representa mint/burn, não é um "holder" de verdade.
         if !from.eq_ignore_ascii_case("0x0000000000000000000000000000000000000000") {
             *balances.entry(from.clone()).or_insert(0) -= amount;
-            *fan_out.entry(from).or_default().entry(to.clone()).or_insert(0) += amount;
+            *fan_out
+                .entry(from)
+                .or_default()
+                .entry(to.clone())
+                .or_insert(0) += amount;
         }
         if !to.eq_ignore_ascii_case("0x0000000000000000000000000000000000000000") {
             *balances.entry(to).or_insert(0) += amount;
@@ -396,7 +492,8 @@ async fn analyze_transfers(client: &reqwest::Client, token: &str, from_block: u6
             if mean <= 0.0 {
                 return None;
             }
-            let variance = amounts.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / amounts.len() as f64;
+            let variance =
+                amounts.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / amounts.len() as f64;
             let coeff_of_variation = variance.sqrt() / mean;
             // Quantias dentro de ~15% umas das outras — dispersão baixa
             // demais pra ser coincidência entre 5+ destinatários distintos.
@@ -404,7 +501,11 @@ async fn analyze_transfers(client: &reqwest::Client, token: &str, from_block: u6
         })
         .max_by_key(|(_, count)| *count);
 
-    Some(TransferAnalysis { top_holder_pct, top5_holder_pct, sybil_candidate })
+    Some(TransferAnalysis {
+        top_holder_pct,
+        top5_holder_pct,
+        sybil_candidate,
+    })
 }
 
 fn parse_hex_u64(s: &str) -> Option<u64> {
@@ -412,7 +513,12 @@ fn parse_hex_u64(s: &str) -> Option<u64> {
 }
 
 async fn eth_call(client: &reqwest::Client, to: &str, selector: &str) -> Option<String> {
-    eth_call_raw(client, "eth_call", serde_json::json!([{ "to": to, "data": format!("0x{selector}") }, "latest"])).await
+    eth_call_raw(
+        client,
+        "eth_call",
+        serde_json::json!([{ "to": to, "data": format!("0x{selector}") }, "latest"]),
+    )
+    .await
 }
 
 async fn eth_call_raw(client: &reqwest::Client, method: &str, params: Value) -> Option<String> {
@@ -427,7 +533,11 @@ fn extract_address(topic: Option<&Value>) -> String {
         return "?".to_string();
     };
     let hex = t.trim_start_matches("0x");
-    let addr = if hex.len() >= 40 { &hex[hex.len() - 40..] } else { hex };
+    let addr = if hex.len() >= 40 {
+        &hex[hex.len() - 40..]
+    } else {
+        hex
+    };
     format!("0x{addr}")
 }
 
@@ -451,4 +561,18 @@ fn decode_address_from_data(data: &str, word_index: usize) -> Option<String> {
     let word = hex.get(start..start + 64)?;
     let addr = &word[word.len() - 40..];
     Some(format!("0x{addr}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_created_topic_is_a_complete_keccak_hash() {
+        assert_eq!(PAIR_CREATED_TOPIC.len(), 66);
+        assert_eq!(
+            PAIR_CREATED_TOPIC,
+            "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
+        );
+    }
 }

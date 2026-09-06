@@ -8,7 +8,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::fusion::{record_deposit, WhaleBoard};
 use crate::sources::SignalSource;
-use crate::types::{Direction, Market, Opportunity, Strategy};
+use crate::types::{next_signal_id, Direction, ExecutionMode, Market, Opportunity, Strategy};
 
 // PublicNode oferece WSS público para Ethereum mainnet sem exigir cadastro
 // ou chave de API — ponto de partida razoável, usado por padrão. Pra
@@ -18,7 +18,8 @@ use crate::types::{Direction, Market, Opportunity, Strategy};
 // mudança de código é necessária. Isso não pode ser feito por mim — criar
 // contas é uma ação exclusiva do usuário.
 fn eth_ws_url() -> String {
-    std::env::var("AURUMOS_ETH_WS_URL").unwrap_or_else(|_| "wss://ethereum-rpc.publicnode.com".to_string())
+    std::env::var("AURUMOS_ETH_WS_URL")
+        .unwrap_or_else(|_| "wss://ethereum-rpc.publicnode.com".to_string())
 }
 
 // keccak256("Transfer(address,address,uint256)") — assinatura padrão do
@@ -120,7 +121,11 @@ async fn run_once(tx: &Sender<Opportunity>, whale_board: &WhaleBoard) -> anyhow:
         });
         futures_util::SinkExt::send(&mut sink, WsMessage::Text(sub.to_string())).await?;
     }
-    tracing::info!(chain = "ethereum_mainnet", limiar_usd = MIN_WHALE_USD, "whale watch: assinaturas de Transfer USDT e USDC enviadas");
+    tracing::info!(
+        chain = "ethereum_mainnet",
+        limiar_usd = MIN_WHALE_USD,
+        "whale watch: assinaturas de Transfer USDT e USDC enviadas"
+    );
 
     // Provedores públicos/anônimos às vezes derrubam a conexão sem enviar
     // um Close frame — sem isso, `stream.next().await` ficaria pendurado
@@ -136,7 +141,10 @@ async fn run_once(tx: &Sender<Opportunity>, whale_board: &WhaleBoard) -> anyhow:
         let msg = match next {
             Ok(Some(m)) => m,
             Ok(None) => anyhow::bail!("stream do nó encerrou"),
-            Err(_) => anyhow::bail!("nenhuma mensagem do nó em {}s — tratando como conexão morta", READ_TIMEOUT.as_secs()),
+            Err(_) => anyhow::bail!(
+                "nenhuma mensagem do nó em {}s — tratando como conexão morta",
+                READ_TIMEOUT.as_secs()
+            ),
         };
         match msg? {
             WsMessage::Text(text) => {
@@ -184,7 +192,11 @@ async fn handle_message(text: &str, tx: &Sender<Opportunity>, whale_board: &Whal
     let Some(amount_usd) = decode_amount_usd(data) else {
         return;
     };
-    tracing::debug!(token, amount_usd, "transfer recebido (abaixo ou acima do limiar)");
+    tracing::debug!(
+        token,
+        amount_usd,
+        "transfer recebido (abaixo ou acima do limiar)"
+    );
     if amount_usd < MIN_WHALE_USD {
         return;
     }
@@ -214,6 +226,7 @@ async fn handle_message(text: &str, tx: &Sender<Opportunity>, whale_board: &Whal
     };
 
     let opp = Opportunity {
+        signal_id: next_signal_id(),
         market: Market::Crypto,
         strategy: Strategy::WhaleWatch,
         asset: format!("{token} {amount_usd:.0}{label_note}"),
@@ -225,10 +238,12 @@ async fn handle_message(text: &str, tx: &Sender<Opportunity>, whale_board: &Whal
         // ainda, valor é só placeholder consistente com valid_for_ms.
         expected_holding_secs: 60.0,
         capital_needed: 10.0,
+        reference_price: None,
         max_loss_pct: 0.01,
         leverage: 1.0,
         correlation_group: "whale_signal".to_string(),
-        sampled_return: None,
+        execution_mode: ExecutionMode::ObservationOnly,
+        capital_multiplier: 1.0,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;
@@ -238,7 +253,11 @@ async fn handle_message(text: &str, tx: &Sender<Opportunity>, whale_board: &Whal
 /// USDT e USDC têm 6 casas decimais, então dividimos por 10^6 direto.
 fn decode_amount_usd(data: &str) -> Option<f64> {
     let raw = data.strip_prefix("0x")?;
-    let hex_tail = if raw.len() > 32 { &raw[raw.len() - 32..] } else { raw };
+    let hex_tail = if raw.len() > 32 {
+        &raw[raw.len() - 32..]
+    } else {
+        raw
+    };
     let units = u128::from_str_radix(hex_tail, 16).ok()?;
     Some(units as f64 / 1_000_000.0)
 }
@@ -250,6 +269,10 @@ fn extract_address(topic: Option<&Value>) -> String {
         return "?".to_string();
     };
     let hex = t.trim_start_matches("0x");
-    let addr = if hex.len() >= 40 { &hex[hex.len() - 40..] } else { hex };
+    let addr = if hex.len() >= 40 {
+        &hex[hex.len() - 40..]
+    } else {
+        hex
+    };
     format!("0x{addr}")
 }

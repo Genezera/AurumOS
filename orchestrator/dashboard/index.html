@@ -223,7 +223,7 @@
   .pulse-card .stats { display: flex; justify-content: space-between; font-size: 10px; color: var(--grey); }
   .pulse-card .stats b { color: var(--text); font-family: var(--font-data); font-variant-numeric: tabular-nums; }
   /* Card "dormente" — estratégias observacionais ou fora da janela de
-     disparo (Macro, Launch, Multi-Asset fora do pregão etc.): em vez de
+     disparo (Macro, Launch etc.): em vez de
      forçar um gráfico vazio de PnL que não existe, mostra por que está
      quieto agora e desde quando. */
   .pulse-card .dormant-hint { font-size: 9.8px; color: var(--grey); line-height: 1.4; min-height: 30px; margin: 4px 0 7px; display: flex; align-items: center; }
@@ -357,32 +357,30 @@
   <main id="content"></main>
 </div>
 
-<footer>Dados sintéticos de paper trading — nenhuma ordem real é enviada por este painel. Histórico mantido no processo do orquestrador desde o boot.</footer>
+<footer id="executionFooter">Dados de mercado reais; carregando modo de execução…</footer>
 
 <script>
 const STRATEGIES = [
-  { key: 'arbitrage',       label: 'Arbitragem',       color: '#F5C453', real: true,  source: 'book Bybit + Bitget' },
-  { key: 'order_flow',      label: 'Order Flow',       color: '#F5C453', real: true,  source: 'book Bybit' },
+  { key: 'order_flow',      label: 'Microestrutura 5–60s', color: '#F5C453', real: true, source: 'Bybit linear: OFI de eventos + negócios; resultado por signal_id' },
+  { key: 'funding_carry',   label: 'Funding Carry',     color: '#36E3A0', real: true, source: 'Bybit spot + perp: bid/ask, L1, turnover, funding e próximo settlement; observacional' },
   { key: 'news',            label: 'News Reactor',     color: '#18D7FF', real: true,  source: 'SEC EDGAR (filings 8-K ao vivo) + classificação via LLM local (Ollama)' },
   { key: 'launch',          label: 'Launch Radar',     color: '#18D7FF', real: true,  source: 'Bybit instruments-info + PairCreated Uniswap V2 (holders, LP queimado, sybil)' },
   { key: 'pump_exhaustion', label: 'Pump Exhaustion',  color: '#18D7FF', real: true,  source: 'funding + 24h + crescimento de OI da Bybit (perpétuos)' },
   { key: 'whale_watch',     label: 'Whale Watch',      color: '#18D7FF', real: true,  source: 'on-chain Ethereum (Transfer USDT/USDC) + rotulagem de exchanges conhecidas' },
   { key: 'macro',           label: 'Macro Engine',     color: '#18D7FF', real: true,  source: 'calendário oficial FOMC/CPI/NFP 2026' },
   { key: 'liquidation_hunter', label: 'Liquidation Hunter', color: '#18D7FF', real: true, source: 'allLiquidation da Bybit (perpétuos)' },
-  { key: 'multi_asset',     label: 'Multi-Asset',      color: '#18D7FF', real: true, source: 'trades ao vivo via Alpaca (IEX)' },
 ];
 /* Icones oficiais do AurumOS Brand Kit (dois tons: dourado = função, cyan = sinal). */
 const STRATEGY_ICONS = {
   overview: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><path d="M32 7a25 25 0 1 0 25 25H32V7Z" stroke="#F5C453" stroke-width="3" stroke-linejoin="round"/><path d="M39 7v18h18A25 25 0 0 0 39 7Z" fill="#18D7FF"/><path d="m18 43 8-9 7 5 10-13" stroke="#F5C453" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-  arbitrage: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><rect x="7" y="12" width="18" height="18" rx="4" stroke="#F5C453" stroke-width="3"/><rect x="39" y="34" width="18" height="18" rx="4" stroke="#F5C453" stroke-width="3"/><path d="M23 43h13l-4-4M41 21H28l4 4" stroke="#18D7FF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="m23 43 5 5M41 21l-5-5" stroke="#18D7FF" stroke-width="3" stroke-linecap="round"/></svg>',
   order_flow: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><circle cx="32" cy="32" r="24" stroke="#F5C453" stroke-width="3" opacity=".45"/><path d="M14 24c7-12 24-15 35-6l4 4M50 40c-7 12-24 15-35 6l-4-4" stroke="#F5C453" stroke-width="3" stroke-linecap="round"/><path d="m45 22 8 0 0-8M19 42h-8v8" stroke="#18D7FF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 32h24" stroke="#F5C453" stroke-width="3" stroke-linecap="round"/></svg>',
+  funding_carry: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><path d="M9 22h36M19 13l-10 9 10 9M55 42H19M45 33l10 9-10 9" stroke="#F5C453" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="32" cy="32" r="7" stroke="#18D7FF" stroke-width="3"/></svg>',
   news: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><rect x="8" y="11" width="48" height="42" rx="6" stroke="#F5C453" stroke-width="3"/><path d="M17 21h19M17 29h30M17 45h9l4-9 5 13 5-11 3 7h5" stroke="#F5C453" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><circle cx="47" cy="21" r="4" fill="#18D7FF"/></svg>',
   launch: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><circle cx="29" cy="35" r="21" stroke="#F5C453" stroke-width="3"/><circle cx="29" cy="35" r="11" stroke="#F5C453" stroke-width="3" opacity=".7"/><path d="M29 35 50 17" stroke="#18D7FF" stroke-width="3" stroke-linecap="round"/><path d="m43 10 11-3-3 11" stroke="#F5C453" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><circle cx="29" cy="35" r="3" fill="#18D7FF"/></svg>',
   pump_exhaustion: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><path d="M7 51 20 37l9 6 13-29 15 10" stroke="#F5C453" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="m49 19 8 5-5 8M42 14l4-7" stroke="#18D7FF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 57h48" stroke="#F5C453" stroke-width="3" stroke-linecap="round" opacity=".5"/></svg>',
   whale_watch: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><path d="M8 36c5 12 18 18 31 13 7-3 10-8 12-14 3 2 6 2 9 0-2-5-6-8-11-8-3-10-11-15-21-14-2 8-7 15-20 16 0 2 0 5 0 7Z" stroke="#F5C453" stroke-width="3" stroke-linejoin="round"/><circle cx="40" cy="28" r="2" fill="#18D7FF"/><path d="M14 45c9 2 17 0 23-5" stroke="#18D7FF" stroke-width="3" stroke-linecap="round"/></svg>',
   macro: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><rect x="8" y="12" width="48" height="43" rx="7" stroke="#F5C453" stroke-width="3"/><path d="M8 24h48M20 7v11M44 7v11" stroke="#F5C453" stroke-width="3" stroke-linecap="round"/><path d="m16 44 8-8 7 5 9-12 8 6" stroke="#18D7FF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   liquidation_hunter: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><rect x="8" y="17" width="9" height="32" rx="2" stroke="#F5C453" stroke-width="3"/><path d="m25 20 9 28M39 24l15 23" stroke="#F5C453" stroke-width="8" stroke-linecap="round"/><path d="M8 55h49" stroke="#18D7FF" stroke-width="3" stroke-linecap="round"/></svg>',
-  multi_asset: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><path d="M10 54V39h9v15M27 54V29h9v25M44 54V18h9v36" stroke="#F5C453" stroke-width="3" stroke-linejoin="round"/><path d="m8 34 14-12 10 6 20-18" stroke="#18D7FF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="m45 10h7v7" stroke="#18D7FF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   risk: '<svg viewBox="0 0 64 64" fill="none" width="15" height="15"><path d="M32 6 53 14v16c0 14-9 23-21 28C20 53 11 44 11 30V14L32 6Z" stroke="#F5C453" stroke-width="3" stroke-linejoin="round"/><path d="M17 33h8l4-10 7 20 4-10h7" stroke="#18D7FF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
 };
 const STRAT_BY_KEY = Object.fromEntries(STRATEGIES.map(s => [s.key, s]));
@@ -390,6 +388,7 @@ const FEED_CAP = 400;
 const MARKER_CAP = 500;
 
 const state = {
+  executionBackend: 'shadow',
   startedAtMs: null,
   activeTab: 'overview',
   latestSnapshot: null,
@@ -401,7 +400,7 @@ const state = {
   halt: null,
   warn: null,
   macroCalendar: [],
-  symbolUniverse: { linear: { total: 0, top: [] }, spot: { total: 0, top: [] } },
+  symbolUniverse: { linear: { total: 0, top: [] } },
   perStrategy: Object.fromEntries(STRATEGIES.map(s => [s.key, {
     received: 0, approved: 0, rejected: 0, wins: 0, losses: 0,
     pnl: 0, exposure: 0, lastEdge: null, lastConfidence: null,
@@ -421,6 +420,7 @@ let chartKind = null; // 'overview' | strategy key
 /// de processar qualquer backlog — ver comentário no ws.onmessage sobre por
 /// que isso precisa ser incondicional, não só quando o servidor reinicia.
 function resetClientState() {
+  state.executionBackend = 'shadow';
   state.latestSnapshot = null;
   state.riskConfig = null;
   state.totalEvents = 0;
@@ -442,6 +442,7 @@ function resetClientState() {
 function fmtUsd(v) { return (v < 0 ? '-$' : '$') + Math.abs(v).toFixed(2); }
 function fmtPct(v) { return v.toFixed(2) + '%'; }
 function fmtTime(ms) { return new Date(ms).toLocaleTimeString('pt-BR'); }
+function signalRef(e) { return e.signal_id ? `#${e.signal_id} ` : ''; }
 function toSec(ms) { return Math.floor(ms / 1000); }
 
 function pushCapped(arr, item, cap) { arr.push(item); if (arr.length > cap) arr.shift(); }
@@ -621,15 +622,25 @@ function describeEvent(e) {
   if (e.type === 'decision') {
     if (e.approved) {
       return { cls: 'approved', kind: 'approved', asset: e.asset, time,
-        html: `<span class="main"><span class="icon">${ICONS.approved}</span><b>${label}</b> ${e.asset} — aprovado, ordem ${fmtUsd(e.order_size)}</span><span class="time">${time}</span>` };
+        html: `<span class="main"><span class="icon">${ICONS.approved}</span><b>${label}</b> ${signalRef(e)}${e.asset} — aprovado, ordem ${fmtUsd(e.order_size)}</span><span class="time">${time}</span>` };
     }
     return { cls: 'rejected', kind: 'rejected', asset: e.asset, time,
-      html: `<span class="main"><span class="icon">${ICONS.rejected}</span><b>${label}</b> ${e.asset} — rejeitado (${e.reason})</span><span class="time">${time}</span>` };
+      html: `<span class="main"><span class="icon">${ICONS.rejected}</span><b>${label}</b> ${signalRef(e)}${e.asset} — rejeitado (${e.reason})</span><span class="time">${time}</span>` };
   }
   if (e.type === 'trade_result') {
     const verb = e.outcome === 'win' ? 'ganhou' : 'perdeu';
     return { cls: e.outcome, kind: e.outcome, asset: e.asset, time,
-      html: `<span class="main"><span class="icon">${ICONS[e.outcome]}</span><b>${label}</b> ${e.asset} — ${verb} ${fmtUsd(e.pnl)}, equity ${fmtUsd(e.equity_after)}</span><span class="time">${time}</span>` };
+      html: `<span class="main"><span class="icon">${ICONS[e.outcome]}</span><b>${label}</b> ${signalRef(e)}${e.asset} — ${verb} ${fmtUsd(e.pnl)}, equity ${fmtUsd(e.equity_after)}</span><span class="time">${time}</span>` };
+  }
+  if (e.type === 'execution') {
+    const filled = e.status === 'filled';
+    const openRisk = e.status === 'open_risk';
+    const mode = state.executionBackend === 'bybit_demo' ? 'Demo' : 'shadow';
+    const detail = filled
+      ? `${mode} ${fmtUsd(e.filled_notional)}, retorno ${(e.return_pct * 100).toFixed(3)}%, ${e.latency_ms}ms`
+      : openRisk ? `RISCO ABERTO — ${e.note}` : `sem fill (${e.note})`;
+    return { cls: filled ? 'approved' : 'rejected', kind: filled ? 'approved' : 'rejected', asset: e.asset, time,
+      html: `<span class="main"><span class="icon">${filled ? '⇄' : (openRisk ? '⛔' : '○')}</span><b>${label}</b> #${e.signal_id} — ${detail}</span><span class="time">${time}</span>` };
   }
   if (e.type === 'leg_resized') {
     const verb = e.direction === 'increase' ? 'aumentou' : 'reduziu';
@@ -666,10 +677,12 @@ function applyEvent(e, replay) {
     const d = describeEvent(e);
     pushCapped(s.feed, d, FEED_CAP);
     pushCapped(state.overviewFeed, { ...d, strategy: e.strategy }, FEED_CAP);
-  } else if (e.type === 'decision') {
+  } else if (e.type === 'decision' || e.type === 'execution') {
     const s = state.perStrategy[e.strategy];
     if (!s) return;
-    if (e.approved) s.approved++; else s.rejected++;
+    if (e.type === 'decision') {
+      if (e.approved) s.approved++; else s.rejected++;
+    }
     const d = describeEvent(e);
     pushCapped(s.feed, d, FEED_CAP);
     pushCapped(state.overviewFeed, { ...d, strategy: e.strategy }, FEED_CAP);
@@ -713,6 +726,9 @@ function applyEvent(e, replay) {
     (e.leg_sizes || []).forEach(([k, v]) => { if (state.perStrategy[k]) state.perStrategy[k].legSize = v; });
   } else if (e.type === 'risk_config') {
     state.riskConfig = e;
+  } else if (e.type === 'execution_backend') {
+    state.executionBackend = e.backend;
+    renderExecutionMode();
   } else if (e.type === 'macro_calendar') {
     state.macroCalendar = e.events;
     if (!replay && state.activeTab === 'macro') renderMacroCalendar();
@@ -759,6 +775,14 @@ function renderRiskStatus() {
   } else {
     el.className = '';
   }
+}
+
+function renderExecutionMode() {
+  const footer = document.getElementById('executionFooter');
+  if (!footer) return;
+  footer.textContent = state.executionBackend === 'bybit_demo'
+    ? 'Dados de mercado reais; ordens e PnL na conta Bybit Demo. Endpoint de produção ausente do binário.'
+    : 'Dados de mercado reais; execução e PnL em shadow mode. Nenhuma ordem é enviada à corretora.';
 }
 
 // ---------------- live incremental UI updates ----------------
@@ -940,13 +964,12 @@ function renderOverview() {
     <div class="grid2" style="margin-bottom:20px;">
       <div class="panel">
         <h2><span>Universo perpétuos — <span id="symbolUniverseCount-linear">carregando…</span></span></h2>
-        <p class="hint">Pump Exhaustion, Liquidation Hunter (funding/OI/liquidação — não usam spread de book). Rotação a cada 15min por volume real da Bybit linear. A coluna de edge fica zerada por padrão: nenhuma fonte mede spread de book de perpétuo hoje (Order Flow, que fazia essa medição, opera no book spot — ver painel ao lado).</p>
+        <p class="hint">Bybit perpétuos USDT. A microestrutura mede book + negócios por símbolo; a rotação mantém 50 vagas reais de exploração e só promove edge com evidência própria.</p>
         <div id="symbolUniverseList-linear"></div>
       </div>
       <div class="panel">
-        <h2><span>Universo spot (arbitragem) — <span id="symbolUniverseCount-spot">carregando…</span></span></h2>
-        <p class="hint">Bybit spot x Bitget spot. Universo PRÓPRIO (12/08/2026) — edge medido é o spread cross-exchange real, diferente do book único que os perpétuos usam.</p>
-        <div id="symbolUniverseList-spot"></div>
+        <h2><span>Política de execução</span></h2>
+        <p class="hint">Uma única corretora e alavancagem 1x. Só Microestrutura 5–60s pode executar, após 200 amostras válidas do mesmo símbolo+horizonte, divisão temporal treino/validação e LCB95 positivo sem o melhor trade de validação. Todos os outros módulos são sensores.</p>
       </div>
     </div>
     <div class="grid2">
@@ -967,7 +990,7 @@ function renderOverview() {
       </div>
       <div class="panel">
         <h2>Risco por estratégia</h2>
-        <p class="hint">Cada ordem fecha instantaneamente neste estágio (paper trading), então "risco aberto" quase sempre mostra US$0 entre um snapshot e outro — não é falha, é o modelo de execução round-trip. As colunas de limite e perna são o que fica sempre visível e conectado de verdade a <code>risk.toml</code> e ao escalonamento por Kelly.</p>
+        <p class="hint">A reserva fica aberta entre o sinal e o relatório ligado pelo mesmo ID. Em shadow, timeout libera como unfilled. Em Demo, incerteza preserva a exposição e bloqueia novas ordens para reconciliação.</p>
         <table class="data" id="exposureTable">
           <thead><tr><th>Estratégia</th><th>Limite de risco</th><th>Perna atual</th><th>Risco aberto agora</th></tr></thead>
           <tbody></tbody>
@@ -1083,7 +1106,7 @@ function renderRiskCockpit() {
 // isso a rotação automática seria invisível, uma lista mudando sozinha nos
 // bastidores sem ninguém saber.
 function renderSymbolUniverse() {
-  ['linear', 'spot'].forEach(kind => {
+  ['linear'].forEach(kind => {
     const el = document.getElementById(`symbolUniverseList-${kind}`);
     const countEl = document.getElementById(`symbolUniverseCount-${kind}`);
     if (!el) return;
@@ -1114,12 +1137,12 @@ function renderSymbolUniverse() {
 // conectado"). São fatos verificados sobre cada módulo, não um chute.
 const DORMANT_HINT = {
   news: 'Observação — classifica notícias reais via LLM local, mas net_edge é sempre 0 por design (sem confirmação de preço ainda)',
+  funding_carry: 'Pesquisa spot+perp em uma única Bybit — só coleta; duas pernas não serão executadas antes de validação e recuperação atômica',
   launch: 'Dispara só quando um par NOVO é listado na Bybit — evento raro por natureza, não falha',
   pump_exhaustion: 'Sinal ativo — net_edge só fica positivo após 20 confirmações de preço reais acumularem',
   whale_watch: 'Observação — alimenta a fusão com Pump Exhaustion; net_edge sempre 0 por design',
   macro: 'Dispara só numa janela de -5min/+15min ao redor de FOMC/CPI/NFP — dormente o resto do tempo',
   liquidation_hunter: 'Observação — alimenta a fusão com Pump Exhaustion; net_edge sempre 0 por design',
-  multi_asset: 'Ativo só no horário de pregão de NY (9:30-16h ET) — reconecta em loop fora disso, não é falha',
 };
 
 function renderStrategyPulseGrid() {
@@ -1205,7 +1228,7 @@ function updateStrategyKpis(key) {
       panel.style.display = 'block';
       setKpi('hb-count', s.heartbeat.symbolsWatched);
       setKpi('hb-symbol', s.heartbeat.bestSymbol);
-      const label = key === 'pump_exhaustion' ? 'proximidade do gatilho' : 'edge líquido';
+      const label = key === 'pump_exhaustion' ? 'proximidade do gatilho' : key === 'funding_carry' ? 'líquido estressado/3 períodos' : 'edge líquido';
       const el = document.getElementById('hb-edge');
       if (el) {
         el.textContent = `(${label}: ${s.heartbeat.bestEdgePct.toFixed(2)}%)`;
@@ -1262,8 +1285,8 @@ function renderStrategyTab(key) {
       <span class="icon" style="filter:drop-shadow(0 0 6px ${meta.color}66);">${STRATEGY_ICONS[key] || ''}</span>
       ${meta.label}
       ${meta.real
-        ? `<span style="font-size:10.5px; font-weight:600; color:var(--green); background:rgba(46,139,87,0.12); border:1px solid rgba(46,139,87,0.4); padding:3px 9px; border-radius:999px; letter-spacing:0.4px;">● DADO REAL — ${meta.source}</span>`
-        : '<span style="font-size:10.5px; font-weight:600; color:var(--grey); background:rgba(255,255,255,0.04); border:1px solid var(--border); padding:3px 9px; border-radius:999px; letter-spacing:0.4px;">○ SIMULADO — aguardando módulo real (roadmap)</span>'}
+        ? `<span style="font-size:10.5px; font-weight:600; color:var(--green); background:rgba(46,139,87,0.12); border:1px solid rgba(46,139,87,0.4); padding:3px 9px; border-radius:999px; letter-spacing:0.4px;">● DADOS REAIS — ${meta.source}</span>`
+        : '<span style="font-size:10.5px; font-weight:600; color:var(--grey); background:rgba(255,255,255,0.04); border:1px solid var(--border); padding:3px 9px; border-radius:999px; letter-spacing:0.4px;">○ SEM EXECUÇÃO</span>'}
     </h2>
     <div class="panel" id="heartbeatPanel" style="margin-bottom:16px; display:none; padding:12px 16px;">
       <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
@@ -1355,6 +1378,7 @@ function render() {
   else if (state.activeTab === 'risk') renderRiskTab();
   else renderStrategyTab(state.activeTab);
   STRATEGIES.forEach(s => updateSidebarBadge(s.key));
+  renderExecutionMode();
 }
 
 // ---------------- uptime ----------------

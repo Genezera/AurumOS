@@ -2,7 +2,6 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use rand::Rng;
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
@@ -10,9 +9,11 @@ use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::events::{DashboardEvent, EventBus};
-use crate::fusion::{recent_deposit_pressure_usd, recent_long_liquidation_cascade, LiquidationBoard, WhaleBoard};
+use crate::fusion::{
+    recent_deposit_pressure_usd, recent_long_liquidation_cascade, LiquidationBoard, WhaleBoard,
+};
 use crate::sources::SignalSource;
-use crate::types::{Direction, Market, Opportunity, Strategy};
+use crate::types::{next_signal_id, Direction, ExecutionMode, Market, Opportunity, Strategy};
 
 const BYBIT_LINEAR_WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(8);
@@ -40,13 +41,13 @@ const RAW_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 // padrões de exaustão descritos no roadmap (não uma certeza).
 const FUNDING_EXTREME: f64 = 0.00015; // 0,015%/8h (p90 observado: 0,00017)
 const PUMP_24H_PCNT: f64 = 0.03; // +3% em 24h (p90 observado: 2,84%)
-// Terceira dimensão do scoring (antes só funding+pump) — crescimento de
-// open interest é o "dinheiro novo alavancado entrando" que o roadmap pede
-// ("crescimento de open interest" na lista de métricas da Fase 6).
+                                 // Terceira dimensão do scoring (antes só funding+pump) — crescimento de
+                                 // open interest é o "dinheiro novo alavancado entrando" que o roadmap pede
+                                 // ("crescimento de open interest" na lista de métricas da Fase 6).
 const OI_GROWTH_1H_EXTREME: f64 = 0.01; // +1% em 1h (p90 observado, só amostras válidas: 0,95%)
-// Janela mínima de histórico de OI antes de confiar no cálculo de
-// crescimento — evita "crescimento" espúrio nos primeiros minutos após o
-// boot, quando só temos 1-2 amostras.
+                                        // Janela mínima de histórico de OI antes de confiar no cálculo de
+                                        // crescimento — evita "crescimento" espúrio nos primeiros minutos após o
+                                        // boot, quando só temos 1-2 amostras.
 const OI_HISTORY_MIN_WINDOW: Duration = Duration::from_secs(50 * 60);
 const OI_HISTORY_MAX_WINDOW: Duration = Duration::from_secs(70 * 60);
 // Ampliado de 45s para 30min (13/08/2026, revisão técnica externa): 45s
@@ -158,7 +159,12 @@ impl PumpExhaustionSource {
         liquidation_board: LiquidationBoard,
         whale_board: WhaleBoard,
     ) -> Self {
-        Self { symbols_rx, bus, liquidation_board, whale_board }
+        Self {
+            symbols_rx,
+            bus,
+            liquidation_board,
+            whale_board,
+        }
     }
 }
 
@@ -179,10 +185,14 @@ impl SignalSource for PumpExhaustionSource {
         // OI, cegando permanentemente essa dimensão do score.
         let mut confirmation_history: VecDeque<f64> = VecDeque::new();
         let mut oi_history: HashMap<String, VecDeque<(Instant, f64)>> = HashMap::new();
+        // Precisa sobreviver à rotação do universo. A rotação ocorre a cada
+        // 15 minutos e a confirmação demora 20; alocar isto em `run_once`
+        // apagava toda amostra antes que pudesse maturar.
+        let mut pending_confirmations: Vec<PendingConfirmation> = Vec::new();
         loop {
             let symbols = self.symbols_rx.borrow().clone();
             tokio::select! {
-                result = run_once(&symbols, &tx, &self.bus, &mut confirmation_history, &mut oi_history, &self.liquidation_board, &self.whale_board) => {
+                result = run_once(&symbols, &tx, &self.bus, &mut confirmation_history, &mut pending_confirmations, &mut oi_history, &self.liquidation_board, &self.whale_board) => {
                     if let Err(e) = result {
                         tracing::warn!(error = %e, "conexão de pump exhaustion (Bybit linear) caiu, reconectando em 3s");
                     }
@@ -202,6 +212,7 @@ async fn run_once(
     tx: &Sender<Opportunity>,
     bus: &EventBus,
     confirmation_history: &mut VecDeque<f64>,
+    pending_confirmations: &mut Vec<PendingConfirmation>,
     oi_history: &mut HashMap<String, VecDeque<(Instant, f64)>>,
     liquidation_board: &LiquidationBoard,
     whale_board: &WhaleBoard,
@@ -209,18 +220,24 @@ async fn run_once(
     let (ws, _) = tokio_tungstenite::connect_async(BYBIT_LINEAR_WS_URL).await?;
     let (mut sink, mut stream) = ws.split();
 
-    // Chunked em lotes de 10 tópicos por mensagem (mesmo padrão de
-    // arbitrage.rs/order_flow.rs/liquidation_hunter.rs) — antes mandava tudo
+    // Chunked em lotes de 10 tópicos por mensagem, como os outros feeds da Bybit — antes mandava tudo
     // numa mensagem só, o que funcionava com ~70 símbolos mas arrisca
     // rejeição da Bybit com o universo ampliado (task de 12/08/2026: "pool
     // extremamente maior pesquisando todo o mercado").
     const CHUNK_SIZE: usize = 10;
     let args: Vec<String> = symbols.iter().map(|s| format!("tickers.{s}")).collect();
     for chunk in args.chunks(CHUNK_SIZE) {
-        sink.send(WsMessage::Text(serde_json::json!({ "op": "subscribe", "args": chunk }).to_string()))
-            .await?;
+        sink.send(WsMessage::Text(
+            serde_json::json!({ "op": "subscribe", "args": chunk }).to_string(),
+        ))
+        .await?;
     }
-    tracing::info!(exchange = "bybit_linear", ?symbols, lotes = args.len().div_ceil(CHUNK_SIZE), "pump exhaustion: assinatura de tickers enviada");
+    tracing::info!(
+        exchange = "bybit_linear",
+        symbols = symbols.len(),
+        lotes = args.len().div_ceil(CHUNK_SIZE),
+        "pump exhaustion: assinatura de tickers enviada"
+    );
 
     let mut state: HashMap<String, TickerState> = HashMap::new();
     let mut last_emitted: HashMap<String, Instant> = HashMap::new();
@@ -228,8 +245,10 @@ async fn run_once(
     let mut watchdog = tokio::time::interval(Duration::from_secs(5));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut raw_snapshot = tokio::time::interval(RAW_SNAPSHOT_INTERVAL);
-    let raw_log_path = format!("{}/data/raw_pump_exhaustion.jsonl", env!("CARGO_MANIFEST_DIR"));
-    let mut pending_confirmations: Vec<PendingConfirmation> = Vec::new();
+    let raw_log_path = format!(
+        "{}/data/raw_pump_exhaustion.jsonl",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let mut confirmation_check = tokio::time::interval(CONFIRMATION_CHECK_INTERVAL);
     let mut last_msg = Instant::now();
     const READ_TIMEOUT: Duration = Duration::from_secs(25);
@@ -305,13 +324,13 @@ async fn run_once(
                         }
                     }
                 }
-                pending_confirmations = still_pending;
+                *pending_confirmations = still_pending;
             }
             msg = stream.next() => {
                 last_msg = Instant::now();
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
-                        handle_message(&text, &mut state, &mut last_emitted, tx, &mut pending_confirmations, confirmation_history, liquidation_board, whale_board).await;
+                        handle_message(&text, &mut state, &mut last_emitted, tx, pending_confirmations, confirmation_history, liquidation_board, whale_board).await;
                     }
                     Some(Ok(WsMessage::Ping(p))) => { sink.send(WsMessage::Pong(p)).await?; }
                     Some(Ok(WsMessage::Close(_))) | None => anyhow::bail!("conexão fechada pelo servidor"),
@@ -329,7 +348,10 @@ async fn run_once(
 /// o score sozinha. É a "combinação ponderada" que a Fase 6 do roadmap pede
 /// no lugar de uma única métrica isolada.
 fn exhaustion_score(s: &TickerState) -> f64 {
-    let funding_component = (s.funding_rate.abs() / FUNDING_EXTREME).min(1.5);
+    // Exaustão de alta/entrada short requer longs pagando funding positivo.
+    // Funding negativo extremo descreve shorts lotados e não pode reforçar
+    // a mesma direção por meio de `abs()`.
+    let funding_component = (s.funding_rate.max(0.0) / FUNDING_EXTREME).min(1.5);
     let pump_component = (s.price_24h_pcnt.max(0.0) / PUMP_24H_PCNT).min(1.5);
     let oi_component = (s.oi_growth_1h_pct.max(0.0) / OI_GROWTH_1H_EXTREME).min(1.5);
     (funding_component + pump_component + oi_component) / 3.0
@@ -343,7 +365,11 @@ fn empirical_edge(history: &VecDeque<f64>) -> Option<(f64, f64)> {
     if history.len() < MIN_CONFIRMATION_SAMPLES {
         return None;
     }
-    let avg_return = history.iter().map(|m| -m - ROUND_TRIP_TAKER_FEE).sum::<f64>() / history.len() as f64;
+    let avg_return = history
+        .iter()
+        .map(|m| -m - ROUND_TRIP_TAKER_FEE)
+        .sum::<f64>()
+        / history.len() as f64;
     // Acerto continua definido pelo movimento bruto de preço (a taxa não
     // muda a DIREÇÃO do resultado, só o tamanho) — não usar `net_of_fee <
     // 0.0` aqui faria um trade que teria empatado sem taxa contar como
@@ -386,13 +412,25 @@ async fn handle_message(
     // "snapshot" vem completo; "delta" só traz os campos que mudaram — por
     // isso fazemos merge em cima do estado anterior em vez de substituir.
     let entry = state.entry(symbol.to_string()).or_default();
-    if let Some(v) = data.get("fundingRate").and_then(Value::as_str).and_then(|s| s.parse().ok()) {
+    if let Some(v) = data
+        .get("fundingRate")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse().ok())
+    {
         entry.funding_rate = v;
     }
-    if let Some(v) = data.get("price24hPcnt").and_then(Value::as_str).and_then(|s| s.parse().ok()) {
+    if let Some(v) = data
+        .get("price24hPcnt")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse().ok())
+    {
         entry.price_24h_pcnt = v;
     }
-    if let Some(v) = data.get("lastPrice").and_then(Value::as_str).and_then(|s| s.parse().ok()) {
+    if let Some(v) = data
+        .get("lastPrice")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse().ok())
+    {
         entry.last_price = v;
     }
     if let Some(v) = data
@@ -438,7 +476,8 @@ async fn handle_message(
     // exchanges conhecidas (mercado geral), contam como reforço — com o
     // score já moderadamente esticado (EXHAUSTION_SCORE_WEAK) MAIS pelo
     // menos 1 reforço externo, dispensa o score forte sozinho.
-    let fusion_liq = recent_long_liquidation_cascade(liquidation_board, symbol, LIQUIDATION_FUSION_WINDOW);
+    let fusion_liq =
+        recent_long_liquidation_cascade(liquidation_board, symbol, LIQUIDATION_FUSION_WINDOW);
     let fusion_whale_usd = recent_deposit_pressure_usd(whale_board);
     let fusion_whale = fusion_whale_usd > WHALE_FUSION_THRESHOLD_USD;
     let fusion_count = [fusion_liq, fusion_whale].iter().filter(|&&b| b).count();
@@ -475,25 +514,30 @@ async fn handle_message(
         fired_at: Instant::now(),
     });
 
-    let (net_edge, base_confidence, confirmation_note) = match empirical_edge(confirmation_history) {
+    let (net_edge, base_confidence, confirmation_note) = match empirical_edge(confirmation_history)
+    {
         Some((edge, conf)) => {
             let wins = confirmation_history.iter().filter(|&&m| m < 0.0).count();
-            (edge, conf, format!("confirmação real: {wins}/{} acertos, edge médio {:+.2}%", confirmation_history.len(), edge * 100.0))
+            (
+                edge,
+                conf,
+                format!(
+                    "confirmação real: {wins}/{} acertos, edge médio {:+.2}%",
+                    confirmation_history.len(),
+                    edge * 100.0
+                ),
+            )
         }
-        None => (0.0, 0.3, format!("aguardando confirmação ({}/{MIN_CONFIRMATION_SAMPLES} amostras)", confirmation_history.len())),
+        None => (
+            0.0,
+            0.3,
+            format!(
+                "aguardando confirmação ({}/{MIN_CONFIRMATION_SAMPLES} amostras)",
+                confirmation_history.len()
+            ),
+        ),
     };
 
-    // Reamostragem real (achado ao vivo, 13/08/2026: este módulo já tinha
-    // confirmation_history com desfechos reais, igual Order Flow/
-    // Arbitragem, mas nunca sorteava dele — todo trade de Pump Exhaustion
-    // ainda caía no sorteio antigo por confidence). Mesmo padrão: sorteia
-    // um desfecho que REALMENTE aconteceu, convertido pra retorno de uma
-    // posição short líquido de taxa (`-movimento - taxa`), em vez de
-    // deixar o orquestrador decidir por sorteio ponderado.
-    let sampled_return = (confirmation_history.len() >= MIN_CONFIRMATION_SAMPLES).then(|| {
-        let idx = rand::thread_rng().gen_range(0..confirmation_history.len());
-        -confirmation_history[idx] - ROUND_TRIP_TAKER_FEE
-    });
     // Reforço de fusão na confiança (nunca no net_edge — esse continua vindo
     // só da confirmação de preço medida, não de um sinal de outro módulo).
     // +15% por reforço confirmado, até +30% com os dois — nunca acima de
@@ -502,12 +546,15 @@ async fn handle_message(
     let fusion_note = match (fusion_liq, fusion_whale) {
         (true, true) => " [fusão: cascata de longs + depósito em exchange]".to_string(),
         (true, false) => " [fusão: cascata de liquidação de longs]".to_string(),
-        (false, true) => format!(" [fusão: depósito em exchange ${:.0}k/30min]", fusion_whale_usd / 1000.0),
+        (false, true) => format!(
+            " [fusão: depósito em exchange ${:.0}k/30min]",
+            fusion_whale_usd / 1000.0
+        ),
         (false, false) => String::new(),
     };
     let confirmation_note = format!("{confirmation_note}{fusion_note}");
 
-    tracing::info!(
+    tracing::debug!(
         symbol,
         score,
         funding_rate_pct = snapshot.funding_rate * 100.0,
@@ -520,6 +567,7 @@ async fn handle_message(
     );
 
     let opp = Opportunity {
+        signal_id: next_signal_id(),
         market: Market::Crypto,
         strategy: Strategy::PumpExhaustion,
         asset: format!(
@@ -536,6 +584,7 @@ async fn handle_message(
         // quanto tempo o módulo espera pra saber se o sinal deu certo.
         expected_holding_secs: CONFIRMATION_WINDOW.as_secs_f64(),
         capital_needed: 10.0,
+        reference_price: Some(snapshot.last_price),
         // Continua fixo por enquanto — calibrar isso também a partir do
         // histórico (ex.: pior variação adversa observada) é o próximo
         // passo natural, não feito nesta revisão pra não inflar o escopo
@@ -543,8 +592,26 @@ async fn handle_message(
         max_loss_pct: 0.02,
         leverage: 1.0,
         correlation_group: "altcoins".to_string(),
-        sampled_return,
+        // A confirmação histórica estima a hipótese, mas não é o desfecho
+        // desta oportunidade. Fica observacional até um broker shadow
+        // abrir e fechar esta posição específica com quotes rastreáveis.
+        execution_mode: ExecutionMode::ObservationOnly,
+        capital_multiplier: 1.0,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_funding_does_not_support_a_short_exhaustion_signal() {
+        let state = TickerState {
+            funding_rate: -FUNDING_EXTREME * 10.0,
+            ..TickerState::default()
+        };
+        assert_eq!(exhaustion_score(&state), 0.0);
+    }
 }

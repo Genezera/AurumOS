@@ -1,20 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use rand::Rng;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::Duration;
 
 use crate::events::{DashboardEvent, EventBus};
 use crate::risk::{self, PortfolioState, RiskConfig, TradeOutcome};
-use crate::types::{Opportunity, Strategy};
+use crate::types::{
+    ExecutionBackend, ExecutionMode, ExecutionReport, ExecutionRequest, ExecutionStatus,
+    Opportunity, Strategy,
+};
 
-/// Estratégias cujo `net_edge` vem de preço/book real medido agora (não de
-/// heurística informativa com edge zerado). Confluência entre duas ou mais
-/// destas no mesmo ativo é o único caso em que aplicamos um bônus de score
-/// — nunca entre módulos informativos, que não carregam número de vantagem
-/// nenhum pra somar.
-const PRICE_BASED_STRATEGIES: [Strategy; 3] = [Strategy::Arbitrage, Strategy::OrderFlow, Strategy::PumpExhaustion];
 const CONFLUENCE_COOLDOWN: Duration = Duration::from_secs(60);
 /// Multiplicador de score quando 2+ estratégias de preço real concordam no
 /// mesmo ativo na mesma janela. É uma heurística ("sinais independentes
@@ -23,18 +19,11 @@ const CONFLUENCE_COOLDOWN: Duration = Duration::from_secs(60);
 /// nunca torna operável algo que não teria vantagem sozinho.
 const CONFLUENCE_SCORE_BONUS: f64 = 1.4;
 
-/// Realismo de execução (Seção 3 do roadmap v2) — ainda não cobre fila
-/// maker, rate limits, clock drift ou reconciliação pós-desconexão (lista
-/// completa no PDF), mas modela os dois efeitos que mais inflavam o
-/// resultado do paper trading: preenchimento parcial de ordem e falha da
-/// segunda perna do hedge em arbitragem.
-const PARTIAL_FILL_PROB: f64 = 0.35;
-const PARTIAL_FILL_MIN_FRACTION: f64 = 0.30;
-/// Só se aplica a Arbitragem: a perna 1 (na exchange mais barata/cara)
-/// executa, mas a perna 2 na outra exchange falha ou chega tarde demais —
-/// deixa a posição direcionalmente exposta sem hedge, o oposto de "sem
-/// risco" que arbitragem promete no papel.
-const SECOND_LEG_FAILURE_PROB: f64 = 0.03;
+/// Folga para receber a confirmação depois da latência prevista. Se ela não
+/// chegar, a reserva é cancelada como unfilled e não vira um trade fictício.
+const EXECUTION_REPORT_GRACE: Duration = Duration::from_secs(5);
+const DEMO_EXECUTION_REPORT_GRACE: Duration = Duration::from_secs(20);
+const OPEN_RISK_RECHECK: Duration = Duration::from_secs(60 * 60 * 24);
 
 /// Concorrência por orçamento de risco (auditoria externa, 12/08/2026):
 /// a tabela fixa antiga (1 operação até US$499, 2 de US$500-999, 3 de
@@ -69,17 +58,19 @@ const MAX_TRADES_PER_TICK: usize = 50;
 struct OpenPosition {
     opp: Opportunity,
     approved: risk::Approved,
-    resolves_at: Instant,
+    report_deadline: Instant,
 }
 
 /// Roda o loop central: acumula oportunidades chegando dos módulos, a cada
 /// tick escolhe a melhor entre as ainda válidas e aprovadas pelo risk
-/// engine, simula o resultado (paper trading) e atualiza o portfólio.
+/// engine, aguarda o resultado do backend selecionado e atualiza o portfólio.
 /// Cada passo relevante é publicado no `EventBus` — o dashboard (e qualquer
 /// outro consumidor futuro) lê dali, com histórico completo desde o boot.
 /// Retorna o estado final para o relatório de resumo.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut rx: Receiver<Opportunity>,
+    mut execution_rx: Receiver<ExecutionReport>,
     cfg: RiskConfig,
     max_cycles: u64,
     tick_every: Duration,
@@ -87,25 +78,26 @@ pub async fn run(
     state_path: String,
     kill_file_path: String,
     reset_drawdown_file_path: String,
+    execution_backend: ExecutionBackend,
+    execution_request_tx: Option<Sender<ExecutionRequest>>,
 ) -> PortfolioState {
     // Recupera equity/ciclos/wins/losses de onde parou — sem isso, todo
     // restart do processo (pra aplicar código novo, por exemplo) voltaria
     // pro equity inicial, o que destruiria qualquer continuidade real do
-    // paper trading.
+    // backend de execução.
     let mut portfolio = PortfolioState::load_or_new(&cfg, &state_path);
 
-    // Filtros reais de lote/notional mínimo por símbolo — buscados uma vez
-    // no boot (mudam raramente durante uma sessão). Falha de rede aqui não
-    // é fatal: `risk::evaluate` simplesmente não valida notional mínimo
-    // pros símbolos sem entrada no mapa (falha aberta — melhor não travar
-    // tudo por uma busca incompleta do que fingir que validou algo que não
-    // validou; ver `exchange_filters.rs`).
-    for (symbol, filter) in crate::exchange_filters::fetch_bybit_spot_filters().await {
-        portfolio.symbol_filters.insert(format!("bybit:{symbol}"), filter);
+    // Filtros reais de lote/notional mínimo por símbolo, buscados uma vez
+    // no boot. Símbolos ausentes falham fechado no risk engine.
+    for (symbol, filter) in crate::exchange_filters::fetch_bybit_linear_filters().await {
+        portfolio
+            .symbol_filters
+            .insert(format!("bybit:{symbol}"), filter);
     }
-    for (symbol, filter) in crate::exchange_filters::fetch_bitget_spot_filters().await {
-        portfolio.symbol_filters.insert(format!("bitget:{symbol}"), filter);
-    }
+    // Materializa a sessão mesmo antes do primeiro trade. Assim um restart
+    // durante a calibração não apaga o histórico de eventos por falta do
+    // arquivo de estado inicial.
+    portfolio.save(&state_path);
 
     // Sem isso, os tiles do dashboard ficam em "—" pra sempre até a
     // primeira operação executar — o que pode nunca acontecer se nenhuma
@@ -116,10 +108,12 @@ pub async fn run(
 
     let mut pending: Vec<Opportunity> = Vec::new();
     let mut open_positions: Vec<OpenPosition> = Vec::new();
-    let mut rng = rand::thread_rng();
     let mut confluence_cooldown: HashMap<String, Instant> = HashMap::new();
-    let mut was_halted = false;
+    let mut reported_rejections: HashSet<u64> = HashSet::new();
+    let mut execution_faults: HashSet<u64> = HashSet::new();
+    let mut last_halt_reason: Option<String> = None;
     let mut was_warned = false;
+    let mut execution_channel_open = true;
 
     let mut tick = tokio::time::interval(tick_every);
 
@@ -137,45 +131,99 @@ pub async fn run(
                     }
                 }
             }
+            maybe_report = execution_rx.recv(), if execution_channel_open => {
+                match maybe_report {
+                    Some(report) => {
+                        settle_execution(
+                            &mut portfolio,
+                            &cfg,
+                            report,
+                            &bus,
+                            &mut open_positions,
+                            &mut execution_faults,
+                        );
+                        portfolio.save(&state_path);
+                        if portfolio.total_cycles >= max_cycles {
+                            tracing::info!(cycles = portfolio.total_cycles, "limite de ciclos atingido");
+                            break;
+                        }
+                    }
+                    None => execution_channel_open = false,
+                }
+            }
             _ = tick.tick() => {
                 pending.retain(|o| !o.is_expired());
+                // `reported_rejections` só precisa lembrar de sinais ainda
+                // pendentes — sem podar junto com `pending` ele cresce um
+                // `u64` por sinal rejeitado pelo resto da vida do processo,
+                // nunca liberando memória mesmo depois do sinal expirar.
+                if !pending.is_empty() {
+                    let still_pending: HashSet<u64> =
+                        pending.iter().map(|opp| opp.signal_id).collect();
+                    reported_rejections.retain(|signal_id| still_pending.contains(signal_id));
+                } else {
+                    reported_rejections.clear();
+                }
 
-                // Resolve posições cuja janela real de holding já terminou
-                // ANTES de abrir novas — a exposição que elas liberam fica
-                // disponível pra próxima decisão já neste mesmo tick, em
-                // vez de artificialmente indisponível até o próximo.
+                // Sem relatório ligado ao signal_id não existe resultado.
+                // Uma confirmação perdida apenas libera a reserva como
+                // unfilled; não incrementa ciclos, wins, losses ou Kelly.
                 let now = Instant::now();
                 let mut still_open = Vec::with_capacity(open_positions.len());
-                let mut hit_cycle_limit = false;
-                for pos in open_positions.drain(..) {
-                    if pos.resolves_at > now {
+                for mut pos in open_positions.drain(..) {
+                    if pos.report_deadline > now {
                         still_open.push(pos);
                         continue;
                     }
-                    resolve_position(&mut portfolio, &cfg, pos, &mut rng, &bus);
-                    portfolio.save(&state_path);
-                    if portfolio.total_cycles >= max_cycles {
-                        tracing::info!(cycles = portfolio.total_cycles, "limite de ciclos atingido");
-                        hit_cycle_limit = true;
+                    if execution_backend == ExecutionBackend::BybitDemo {
+                        let first_fault = execution_faults.insert(pos.opp.signal_id);
+                        pos.report_deadline = now + OPEN_RISK_RECHECK;
+                        if first_fault {
+                            tracing::error!(signal_id = pos.opp.signal_id, asset = %pos.opp.asset, "execução Demo sem relatório; exposição preservada e novas ordens bloqueadas");
+                            bus.emit(DashboardEvent::execution_open_risk(
+                                pos.opp.signal_id,
+                                pos.opp.strategy,
+                                &pos.opp.asset,
+                                pos.approved.order_size,
+                                0,
+                                "timeout_demo_requer_reconciliacao",
+                            ));
+                        }
+                        still_open.push(pos);
+                    } else {
+                        risk::cancel_exposure(&mut portfolio, &pos.opp, &pos.approved);
+                        tracing::warn!(signal_id = pos.opp.signal_id, asset = %pos.opp.asset, "execução shadow expirou sem relatório; posição cancelada como unfilled");
+                        bus.emit(DashboardEvent::execution_unfilled(
+                            pos.opp.signal_id,
+                            pos.opp.strategy,
+                            &pos.opp.asset,
+                            "timeout_sem_relatorio",
+                        ));
                     }
+                    portfolio.save(&state_path);
                 }
                 open_positions = still_open;
-                if hit_cycle_limit {
-                    break;
-                }
 
                 let confluence_bonus = detect_and_emit_confluence(&pending, &bus, &mut confluence_cooldown);
 
                 let kill_status = risk::kill_switch_reason(&mut portfolio, &cfg, &kill_file_path, &reset_drawdown_file_path);
-                let is_halted = kill_status.halt.is_some();
-                if is_halted != was_halted {
-                    was_halted = is_halted;
-                    if let Some(reason) = &kill_status.halt {
+                let effective_halt = if execution_faults.is_empty() {
+                    kill_status.halt.clone()
+                } else {
+                    Some(format!(
+                        "risco de execução Demo aberto em {} operação(ões); reconciliação obrigatória",
+                        execution_faults.len()
+                    ))
+                };
+                let is_halted = effective_halt.is_some();
+                if effective_halt != last_halt_reason {
+                    last_halt_reason = effective_halt.clone();
+                    if let Some(reason) = &effective_halt {
                         tracing::warn!(reason, "kill-switch acionado: pausando novas execucoes");
                     } else {
                         tracing::info!("kill-switch liberado: retomando execucoes normalmente");
                     }
-                    bus.emit(DashboardEvent::system_halt(kill_status.halt.clone()));
+                    bus.emit(DashboardEvent::system_halt(effective_halt));
                 }
                 let is_warned = kill_status.warn.is_some();
                 if is_warned != was_warned {
@@ -183,26 +231,34 @@ pub async fn run(
                     if let Some(msg) = &kill_status.warn {
                         tracing::warn!(msg, "aviso preventivo de drawdown");
                     }
-                    // Revisão técnica externa (13/08/2026): o aviso preventivo
-                    // não bastava só avisar — reduzir o tamanho da perna pela
-                    // metade assim que o limiar é cruzado (uma vez, na borda
-                    // da transição, não a cada ciclo enquanto o aviso durar)
-                    // preserva capacidade de composição sem esperar o bloqueio
-                    // rígido do dia seguinte.
-                    if is_warned {
-                        let scale_events = risk::halve_all_legs(&mut portfolio);
-                        if !scale_events.is_empty() {
-                            tracing::warn!(count = scale_events.len(), "aviso preventivo: reduzindo perna de todas as estrategias pela metade");
-                            for scale in scale_events {
-                                bus.emit(DashboardEvent::leg_resized(scale, portfolio.equity));
-                            }
-                        }
-                    }
                     bus.emit(DashboardEvent::risk_warning(kill_status.warn));
                 }
 
                 let slots = if is_halted { 0 } else { MAX_TRADES_PER_TICK };
                 let mut done_this_tick = 0;
+
+                // Um candidato pode ficar pendente por vários ticks porque
+                // um limite transitório ainda está ocupado. Registra a
+                // primeira rejeição de cada signal_id sem inflar o contador
+                // a cada reavaliação.
+                if !is_halted {
+                    for opp in &pending {
+                        if opp.execution_mode != ExecutionMode::ExecutableQuoted || opp.score() <= 0.0 {
+                            continue;
+                        }
+                        if let Err(reason) = risk::evaluate(opp, &portfolio, &cfg) {
+                            if reported_rejections.insert(opp.signal_id) {
+                                portfolio.rejections += 1;
+                                bus.emit(DashboardEvent::decision_rejected(
+                                    opp.signal_id,
+                                    opp.strategy,
+                                    &opp.asset,
+                                    format!("{reason:?}"),
+                                ));
+                            }
+                        }
+                    }
+                }
 
                 while done_this_tick < slots {
                     // Reavalia a cada iteração: depois de ABRIR uma posição,
@@ -211,11 +267,26 @@ pub async fn run(
                     // liberada no mesmo instante), então a 2ª/3ª escolha
                     // respeita o risco já comprometido pela 1ª — nunca é "N
                     // ordens avaliadas contra o mesmo estado congelado".
-                    let Some(idx) = pick_best(&pending, &portfolio, &cfg, &confluence_bonus) else {
+                    let Some(idx) = pick_best(
+                        &pending,
+                        &portfolio,
+                        &cfg,
+                        &confluence_bonus,
+                        &open_positions,
+                    ) else {
                         break;
                     };
                     let opp = pending.remove(idx);
-                    open_position(&mut portfolio, &cfg, opp, &bus, &mut open_positions);
+                    open_position(
+                        &mut portfolio,
+                        &cfg,
+                        opp,
+                        &bus,
+                        &mut open_positions,
+                        execution_backend,
+                        execution_request_tx.as_ref(),
+                    )
+                    .await;
                     portfolio.save(&state_path);
                     done_this_tick += 1;
                 }
@@ -252,7 +323,16 @@ fn detect_and_emit_confluence(
         }
         strategies.sort_by_key(|s| s.key());
 
-        let price_confirmed = strategies.iter().filter(|s| PRICE_BASED_STRATEGIES.contains(s)).count() >= 2;
+        // Um sensor observacional pode aparecer na confluência do painel,
+        // mas só estratégias com executor cotado podem alterar prioridade.
+        let quoted_strategies: HashSet<Strategy> = pending
+            .iter()
+            .filter(|opp| {
+                opp.base_symbol() == symbol && opp.execution_mode == ExecutionMode::ExecutableQuoted
+            })
+            .map(|opp| opp.strategy)
+            .collect();
+        let price_confirmed = quoted_strategies.len() >= 2;
 
         let keys: Vec<&'static str> = strategies.iter().map(|s| s.key()).collect();
         let cooldown_key = format!("{symbol}:{}", keys.join(","));
@@ -263,7 +343,11 @@ fn detect_and_emit_confluence(
 
         if should_fire {
             cooldown.insert(cooldown_key, Instant::now());
-            tracing::info!(symbol, estrategias = ?keys, price_confirmed, "confluência detectada entre estratégias");
+            if price_confirmed {
+                tracing::info!(symbol, estrategias = ?keys, "confluência executável detectada");
+            } else {
+                tracing::debug!(symbol, estrategias = ?keys, "confluência apenas observacional");
+            }
             bus.emit(DashboardEvent::confluence(symbol, keys, price_confirmed));
         }
 
@@ -283,6 +367,7 @@ fn pick_best(
     portfolio: &PortfolioState,
     cfg: &RiskConfig,
     confluence_bonus: &HashMap<String, f64>,
+    open_positions: &[OpenPosition],
 ) -> Option<usize> {
     pending
         .iter()
@@ -298,7 +383,13 @@ fn pick_best(
         // passou aqui, então "tudo rejeitado silenciosamente" era invisível
         // (achado 13/08/2026 investigando trades parados por 5h+ sem erro).
         .filter(|(_, opp)| {
-            if opp.score() <= 0.0 {
+            if open_positions
+                .iter()
+                .any(|position| position.opp.base_symbol() == opp.base_symbol())
+            {
+                return false;
+            }
+            if opp.execution_mode != ExecutionMode::ExecutableQuoted || opp.score() <= 0.0 {
                 return false;
             }
             match risk::evaluate(opp, portfolio, cfg) {
@@ -323,12 +414,14 @@ fn pick_best(
 /// contabilizada (`risk::open_exposure`) e uma ficha do rate limiter da(s)
 /// venue(s) é consumida (`risk::consume_rate_limit`) até `resolve_position`
 /// fechar, quando a janela real de `opp.expected_holding_secs` terminar.
-fn open_position(
+async fn open_position(
     portfolio: &mut PortfolioState,
     cfg: &RiskConfig,
     opp: Opportunity,
     bus: &EventBus,
     open_positions: &mut Vec<OpenPosition>,
+    execution_backend: ExecutionBackend,
+    execution_request_tx: Option<&Sender<ExecutionRequest>>,
 ) {
     let approved = match risk::evaluate(&opp, portfolio, cfg) {
         Ok(a) => a,
@@ -336,6 +429,7 @@ fn open_position(
             portfolio.rejections += 1;
             tracing::debug!(?reason, asset = %opp.asset, "oportunidade rejeitada no gate final");
             bus.emit(DashboardEvent::decision_rejected(
+                opp.signal_id,
                 opp.strategy,
                 &opp.asset,
                 format!("{reason:?}"),
@@ -346,6 +440,7 @@ fn open_position(
     };
 
     bus.emit(DashboardEvent::decision_approved(
+        opp.signal_id,
         opp.strategy,
         &opp.asset,
         approved.order_size,
@@ -354,90 +449,445 @@ fn open_position(
     risk::open_exposure(portfolio, &opp, &approved);
     risk::consume_rate_limit(portfolio, opp.strategy);
 
-    let resolves_at = Instant::now() + Duration::from_secs_f64(opp.expected_holding_secs.max(0.05));
-    open_positions.push(OpenPosition { opp, approved, resolves_at });
+    if execution_backend == ExecutionBackend::BybitDemo {
+        let Some(sender) = execution_request_tx else {
+            risk::cancel_exposure(portfolio, &opp, &approved);
+            bus.emit(DashboardEvent::execution_unfilled(
+                opp.signal_id,
+                opp.strategy,
+                &opp.asset,
+                "executor_demo_indisponivel",
+            ));
+            return;
+        };
+        let request = ExecutionRequest {
+            signal_id: opp.signal_id,
+            symbol: opp.base_symbol().to_string(),
+            direction: opp.direction,
+            quantity: approved.order_qty,
+            price_tick: approved.price_tick,
+            stop_loss_pct: opp.max_loss_pct,
+            expected_holding_secs: opp.expected_holding_secs,
+        };
+        if sender.send(request).await.is_err() {
+            risk::cancel_exposure(portfolio, &opp, &approved);
+            bus.emit(DashboardEvent::execution_unfilled(
+                opp.signal_id,
+                opp.strategy,
+                &opp.asset,
+                "canal_executor_demo_fechado",
+            ));
+            return;
+        }
+    }
+
+    let report_grace = match execution_backend {
+        ExecutionBackend::Shadow => EXECUTION_REPORT_GRACE,
+        ExecutionBackend::BybitDemo => DEMO_EXECUTION_REPORT_GRACE,
+    };
+    let report_deadline = Instant::now()
+        + Duration::from_secs_f64(opp.expected_holding_secs.max(0.05))
+        + report_grace;
+    open_positions.push(OpenPosition {
+        opp,
+        approved,
+        report_deadline,
+    });
 }
 
-/// Resolve uma posição cuja janela real de holding terminou: simula o
-/// resultado (mesma mecânica de sempre — sorteio ponderado pela confiança,
-/// que pra Order Flow/Arbitragem já vem de confirmação real de preço, não
-/// mais chutada) e libera a exposição que `open_position` reservou.
-///
-/// A simulação de resultado em si ainda é só pra exercitar a mecânica do
-/// orquestrador — não é um backtest e não deve ser lida como previsão de
-/// retorno real.
-fn resolve_position(
+/// Liquida exclusivamente pelo relatório que carrega o mesmo `signal_id`.
+/// O notional preenchido vem da menor profundidade observada entre as duas
+/// pernas; nenhum sorteio de win rate ou retorno histórico entra no PnL.
+fn settle_execution(
     portfolio: &mut PortfolioState,
     cfg: &RiskConfig,
-    pos: OpenPosition,
-    rng: &mut impl Rng,
+    report: ExecutionReport,
     bus: &EventBus,
+    open_positions: &mut Vec<OpenPosition>,
+    execution_faults: &mut HashSet<u64>,
 ) {
-    let OpenPosition { opp, approved, .. } = pos;
+    let Some(idx) = open_positions
+        .iter()
+        .position(|p| p.opp.signal_id == report.signal_id)
+    else {
+        tracing::debug!(
+            signal_id = report.signal_id,
+            "relatório sem posição aprovada correspondente; ignorando"
+        );
+        return;
+    };
+    if report.status == ExecutionStatus::OpenRisk {
+        let pos = &mut open_positions[idx];
+        pos.report_deadline = Instant::now() + OPEN_RISK_RECHECK;
+        execution_faults.insert(report.signal_id);
+        tracing::error!(
+            signal_id = report.signal_id,
+            asset = %pos.opp.asset,
+            execution_note = %report.note,
+            "risco de execução aberto; exposição preservada e novas ordens bloqueadas"
+        );
+        bus.emit(DashboardEvent::execution_open_risk(
+            pos.opp.signal_id,
+            pos.opp.strategy,
+            &pos.opp.asset,
+            report.max_executable_notional,
+            report.observed_latency_ms,
+            &report.note,
+        ));
+        bus.emit(DashboardEvent::portfolio_snapshot(portfolio));
+        return;
+    }
 
-    let leg_failed = opp.strategy == Strategy::Arbitrage && rng.gen_bool(SECOND_LEG_FAILURE_PROB);
-    let fill_fraction = if rng.gen_bool(PARTIAL_FILL_PROB) {
-        rng.gen_range(PARTIAL_FILL_MIN_FRACTION..1.0)
+    let OpenPosition { opp, approved, .. } = open_positions.swap_remove(idx);
+    execution_faults.remove(&report.signal_id);
+
+    if report.status == ExecutionStatus::Unfilled {
+        risk::cancel_exposure(portfolio, &opp, &approved);
+        bus.emit(DashboardEvent::execution_unfilled(
+            opp.signal_id,
+            opp.strategy,
+            &opp.asset,
+            &report.note,
+        ));
+        bus.emit(DashboardEvent::portfolio_snapshot(portfolio));
+        return;
+    }
+
+    if !report.return_pct.is_finite()
+        || report
+            .realized_pnl
+            .map(|pnl| !pnl.is_finite())
+            .unwrap_or(false)
+        || !report.max_executable_notional.is_finite()
+        || report.max_executable_notional < 0.0
+    {
+        risk::cancel_exposure(portfolio, &opp, &approved);
+        tracing::warn!(
+            signal_id = opp.signal_id,
+            "relatório de execução contém valores inválidos; cancelando como unfilled"
+        );
+        bus.emit(DashboardEvent::execution_unfilled(
+            opp.signal_id,
+            opp.strategy,
+            &opp.asset,
+            "relatorio_invalido",
+        ));
+        bus.emit(DashboardEvent::portfolio_snapshot(portfolio));
+        return;
+    }
+
+    let filled_size = approved
+        .order_size
+        .min(report.max_executable_notional.max(0.0));
+    if filled_size <= 0.0 {
+        risk::cancel_exposure(portfolio, &opp, &approved);
+        bus.emit(DashboardEvent::execution_unfilled(
+            opp.signal_id,
+            opp.strategy,
+            &opp.asset,
+            &report.note,
+        ));
+        bus.emit(DashboardEvent::portfolio_snapshot(portfolio));
+        return;
+    }
+
+    let fill_fraction = (filled_size / approved.order_size).clamp(0.0, 1.0);
+    let pnl = report
+        .realized_pnl
+        .unwrap_or(filled_size * report.return_pct);
+    let won = pnl > 0.0;
+    let outcome = if won {
+        TradeOutcome::Win
     } else {
-        1.0
+        TradeOutcome::Loss
     };
 
-    let (won, pnl, execution_note) = if leg_failed {
-        // Perna 1 sozinha expõe o notional PEDIDO inteiro (não só o
-        // preenchido) sem hedge — por isso usa order_size, não
-        // filled_size, e o dobro do max_loss_pct modelado.
-        (false, -(approved.order_size * opp.max_loss_pct * 2.0), "falha_segunda_perna")
-    } else {
-        let filled_size = approved.order_size * fill_fraction;
-        // Reamostragem real (auditoria externa, 13/08/2026): quando a
-        // fonte já anexou um desfecho REAL sorteado do próprio histórico
-        // de confirmação (`sampled_return` — Order Flow/Arbitragem, uma
-        // vez com amostra suficiente), usa ele diretamente em vez de
-        // sortear ganhou/perdeu de novo aqui por uma fórmula. O resultado
-        // deste trade passa a herdar um desfecho que realmente aconteceu
-        // com um sinal parecido, não uma combinação sintética de
-        // confidence×net_edge. Estratégias sem essa camada ainda (ou sem
-        // amostra suficiente) caem no sorteio antigo, sem mudança.
-        let (won, pnl) = match opp.sampled_return {
-            Some(realized_return) => (realized_return > 0.0, filled_size * realized_return),
-            None => {
-                let won = rng.gen_bool(opp.confidence.clamp(0.0, 1.0));
-                let pnl = if won {
-                    filled_size * opp.net_edge
-                } else {
-                    -(filled_size * opp.max_loss_pct)
-                };
-                (won, pnl)
-            }
-        };
-        (won, pnl, if fill_fraction < 1.0 { "fill_parcial" } else { "fill_total" })
-    };
-    let outcome = if won { TradeOutcome::Win } else { TradeOutcome::Loss };
+    if -report.return_pct > opp.max_loss_pct {
+        tracing::warn!(
+            signal_id = opp.signal_id,
+            realized_loss_pct = -report.return_pct * 100.0,
+            stress_loss_pct = opp.max_loss_pct * 100.0,
+            "perda executada excedeu o cenário de stress usado no sizing"
+        );
+    }
 
     tracing::info!(
+        signal_id = opp.signal_id,
         strategy = opp.strategy.key(),
         asset = %opp.asset,
         outcome = ?outcome,
         order_size = approved.order_size,
+        filled_size,
         fill_fraction,
-        execution_note,
+        observed_latency_ms = report.observed_latency_ms,
+        execution_note = %report.note,
         pnl,
         equity_after = portfolio.equity + pnl,
         leg_size = portfolio.leg_size(opp.strategy),
-        "ordem simulada executada"
+        "execução liquidada"
     );
 
     let scale_events = risk::record_trade_result(portfolio, cfg, &opp, &approved, outcome, pnl);
 
     bus.emit(DashboardEvent::trade_result(
+        opp.signal_id,
         opp.strategy,
         &opp.asset,
         won,
         pnl,
         portfolio.equity,
     ));
+    bus.emit(DashboardEvent::execution_filled(
+        opp.signal_id,
+        opp.strategy,
+        &opp.asset,
+        filled_size,
+        report.return_pct,
+        report.observed_latency_ms,
+        &report.note,
+    ));
     for scale in scale_events {
         bus.emit(DashboardEvent::leg_resized(scale, portfolio.equity));
     }
     bus.emit(DashboardEvent::portfolio_snapshot(portfolio));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Direction, Market};
+
+    fn config() -> RiskConfig {
+        RiskConfig::load(concat!(env!("CARGO_MANIFEST_DIR"), "/config/risk.toml")).unwrap()
+    }
+
+    fn opportunity(signal_id: u64) -> Opportunity {
+        Opportunity {
+            signal_id,
+            market: Market::Crypto,
+            strategy: Strategy::OrderFlow,
+            asset: "BTCUSDT".to_string(),
+            direction: Direction::Long,
+            net_edge: 0.001,
+            confidence: 0.7,
+            valid_for_ms: 10_000,
+            expected_holding_secs: 5.0,
+            capital_needed: 25.0,
+            reference_price: Some(100.0),
+            max_loss_pct: 0.005,
+            leverage: 1.0,
+            correlation_group: "BTCUSDT".to_string(),
+            execution_mode: ExecutionMode::ExecutableQuoted,
+            capital_multiplier: 1.0,
+            emitted_at: Instant::now(),
+        }
+    }
+
+    fn portfolio_with_btc_filter(cfg: &RiskConfig) -> PortfolioState {
+        let mut portfolio = PortfolioState::new(cfg);
+        portfolio.symbol_filters.insert(
+            "bybit:BTCUSDT".to_string(),
+            risk::SymbolFilter {
+                min_qty: 0.001,
+                qty_step: 0.001,
+                min_notional: 5.0,
+                price_tick: 0.1,
+            },
+        );
+        portfolio
+    }
+
+    #[test]
+    fn pnl_comes_only_from_report_with_matching_signal_id() {
+        let cfg = config();
+        let mut portfolio = portfolio_with_btc_filter(&cfg);
+        let opp = opportunity(7);
+        let approved = risk::evaluate(&opp, &portfolio, &cfg).unwrap();
+        risk::open_exposure(&mut portfolio, &opp, &approved);
+        let mut open = vec![OpenPosition {
+            opp,
+            approved,
+            report_deadline: Instant::now() + Duration::from_secs(10),
+        }];
+        let bus = EventBus::new(32);
+        let mut faults = HashSet::new();
+
+        settle_execution(
+            &mut portfolio,
+            &cfg,
+            ExecutionReport {
+                signal_id: 999,
+                status: ExecutionStatus::Filled,
+                return_pct: 0.50,
+                realized_pnl: None,
+                max_executable_notional: 25.0,
+                observed_latency_ms: 5_000,
+                note: "mismatch".to_string(),
+            },
+            &bus,
+            &mut open,
+            &mut faults,
+        );
+        assert_eq!(portfolio.total_cycles, 0);
+        assert_eq!(portfolio.equity, 200.0);
+
+        settle_execution(
+            &mut portfolio,
+            &cfg,
+            ExecutionReport {
+                signal_id: 7,
+                status: ExecutionStatus::Filled,
+                return_pct: 0.001,
+                realized_pnl: None,
+                max_executable_notional: 25.0,
+                observed_latency_ms: 5_000,
+                note: "quote_real".to_string(),
+            },
+            &bus,
+            &mut open,
+            &mut faults,
+        );
+        assert_eq!(portfolio.total_cycles, 1);
+        assert!((portfolio.equity + portfolio.protected_reserve - 200.025).abs() < 1e-9);
+        assert_eq!(portfolio.total_exposure(), 0.0);
+    }
+
+    #[test]
+    fn invalid_execution_report_is_unfilled_without_pnl() {
+        let cfg = config();
+        let mut portfolio = portfolio_with_btc_filter(&cfg);
+        let opp = opportunity(8);
+        let approved = risk::evaluate(&opp, &portfolio, &cfg).unwrap();
+        risk::open_exposure(&mut portfolio, &opp, &approved);
+        let mut open = vec![OpenPosition {
+            opp,
+            approved,
+            report_deadline: Instant::now() + Duration::from_secs(10),
+        }];
+        let bus = EventBus::new(32);
+        let mut faults = HashSet::new();
+
+        settle_execution(
+            &mut portfolio,
+            &cfg,
+            ExecutionReport {
+                signal_id: 8,
+                status: ExecutionStatus::Filled,
+                return_pct: f64::NAN,
+                realized_pnl: None,
+                max_executable_notional: 25.0,
+                observed_latency_ms: 5_000,
+                note: "corrompido".to_string(),
+            },
+            &bus,
+            &mut open,
+            &mut faults,
+        );
+
+        assert_eq!(portfolio.total_cycles, 0);
+        assert_eq!(portfolio.equity, 200.0);
+        assert_eq!(portfolio.total_exposure(), 0.0);
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn venue_realized_pnl_has_priority_over_reconstructed_return() {
+        let cfg = config();
+        let mut portfolio = portfolio_with_btc_filter(&cfg);
+        let opp = opportunity(11);
+        let approved = risk::evaluate(&opp, &portfolio, &cfg).unwrap();
+        risk::open_exposure(&mut portfolio, &opp, &approved);
+        let mut open = vec![OpenPosition {
+            opp,
+            approved,
+            report_deadline: Instant::now() + Duration::from_secs(10),
+        }];
+        let bus = EventBus::new(32);
+        let mut faults = HashSet::new();
+
+        settle_execution(
+            &mut portfolio,
+            &cfg,
+            ExecutionReport {
+                signal_id: 11,
+                status: ExecutionStatus::Filled,
+                return_pct: 0.0,
+                realized_pnl: Some(0.123),
+                max_executable_notional: 25.1,
+                observed_latency_ms: 20,
+                note: "fills_demo".to_string(),
+            },
+            &bus,
+            &mut open,
+            &mut faults,
+        );
+
+        assert!((portfolio.equity + portfolio.protected_reserve - 200.123).abs() < 1e-9);
+    }
+
+    #[test]
+    fn open_risk_preserves_exposure_and_position() {
+        let cfg = config();
+        let mut portfolio = portfolio_with_btc_filter(&cfg);
+        let opp = opportunity(9);
+        let approved = risk::evaluate(&opp, &portfolio, &cfg).unwrap();
+        risk::open_exposure(&mut portfolio, &opp, &approved);
+        let exposure = portfolio.total_exposure();
+        let mut open = vec![OpenPosition {
+            opp,
+            approved,
+            report_deadline: Instant::now() + Duration::from_secs(10),
+        }];
+        let bus = EventBus::new(32);
+        let mut faults = HashSet::new();
+
+        settle_execution(
+            &mut portfolio,
+            &cfg,
+            ExecutionReport {
+                signal_id: 9,
+                status: ExecutionStatus::OpenRisk,
+                return_pct: 0.0,
+                realized_pnl: None,
+                max_executable_notional: 25.0,
+                observed_latency_ms: 3_000,
+                note: "residual".to_string(),
+            },
+            &bus,
+            &mut open,
+            &mut faults,
+        );
+
+        assert_eq!(portfolio.total_cycles, 0);
+        assert_eq!(portfolio.total_exposure(), exposure);
+        assert_eq!(open.len(), 1);
+        assert!(faults.contains(&9));
+    }
+
+    #[tokio::test]
+    async fn demo_request_uses_exchange_symbol_without_dashboard_annotation() {
+        let cfg = config();
+        let mut portfolio = portfolio_with_btc_filter(&cfg);
+        let mut opp = opportunity(10);
+        opp.asset = "BTCUSDT [Bybit linear; evidência]".to_string();
+        let bus = EventBus::new(32);
+        let mut open = Vec::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        open_position(
+            &mut portfolio,
+            &cfg,
+            opp,
+            &bus,
+            &mut open,
+            ExecutionBackend::BybitDemo,
+            Some(&tx),
+        )
+        .await;
+
+        let request = rx.recv().await.unwrap();
+        assert_eq!(request.symbol, "BTCUSDT");
+        assert!(request.quantity > 0.0);
+        assert_eq!(open.len(), 1);
+    }
 }

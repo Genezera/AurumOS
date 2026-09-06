@@ -6,9 +6,10 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration};
 
 use crate::sources::SignalSource;
-use crate::types::{Direction, Market, Opportunity, Strategy};
+use crate::types::{next_signal_id, Direction, ExecutionMode, Market, Opportunity, Strategy};
 
-const INSTRUMENTS_URL: &str = "https://api.bybit.com/v5/market/instruments-info?category=spot&limit=1000";
+const INSTRUMENTS_URL: &str =
+    "https://api.bybit.com/v5/market/instruments-info?category=spot&limit=1000";
 const POLL_INTERVAL: Duration = Duration::from_secs(90);
 
 /// Fase 5 do roadmap, com escopo reduzido de propósito: detecta pares novos
@@ -51,7 +52,10 @@ impl SignalSource for LaunchRadarSource {
                     known = symbols;
 
                     if first_poll {
-                        tracing::info!(baseline = known.len(), "launch radar: linha de base de pares spot da Bybit estabelecida");
+                        tracing::info!(
+                            baseline = known.len(),
+                            "launch radar: linha de base de pares spot da Bybit estabelecida"
+                        );
                         first_poll = false;
                     } else {
                         for symbol in new_symbols {
@@ -69,7 +73,11 @@ impl SignalSource for LaunchRadarSource {
 }
 
 async fn poll_symbols(client: &reqwest::Client) -> anyhow::Result<HashSet<String>> {
-    let resp = client.get(INSTRUMENTS_URL).send().await?.error_for_status()?;
+    let resp = client
+        .get(INSTRUMENTS_URL)
+        .send()
+        .await?
+        .error_for_status()?;
     let body: Value = resp.json().await?;
     let list = body
         .get("result")
@@ -90,6 +98,7 @@ async fn emit(tx: &Sender<Opportunity>, symbol: &str) {
     tracing::info!(symbol, "novo par spot detectado na Bybit");
 
     let opp = Opportunity {
+        signal_id: next_signal_id(),
         market: Market::Crypto,
         strategy: Strategy::Launch,
         asset: symbol.to_string(),
@@ -100,12 +109,14 @@ async fn emit(tx: &Sender<Opportunity>, symbol: &str) {
         // Informativo (net_edge=0) — placeholder consistente com valid_for_ms.
         expected_holding_secs: 300.0,
         capital_needed: 10.0,
+        reference_price: None,
         max_loss_pct: 0.02,
         // Nunca alavancagem em lançamento — livro/liquidez ainda não são
         // confiáveis logo na abertura (mesma regra do risk.toml).
         leverage: 1.0,
         correlation_group: "new_listings".to_string(),
-        sampled_return: None,
+        execution_mode: ExecutionMode::ObservationOnly,
+        capital_multiplier: 1.0,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;

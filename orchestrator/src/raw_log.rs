@@ -10,12 +10,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// de linhas coladas corrigido la) pra nao corromper o arquivo quando
 /// varias tasks gravam ao mesmo tempo.
 pub fn append(path: &str, value: serde_json::Value) {
-    let Ok(mut line) = serde_json::to_string(&value) else { return };
+    let Ok(mut line) = serde_json::to_string(&value) else {
+        return;
+    };
     line.push('\n');
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = file.write_all(line.as_bytes());
     }
 }

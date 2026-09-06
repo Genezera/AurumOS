@@ -1,7 +1,10 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Piso de tempo real entre dois aumentos de perna da MESMA estratégia —
 /// além da contagem de ciclos (`min_cycles_between_scale`, que sozinha não
@@ -12,8 +15,9 @@ use serde::{Deserialize, Serialize};
 /// 2h por causa disso, um ritmo que nenhuma estratégia real sustentaria
 /// (taxas de exchange, seleção adversa, limite de requisições da API).
 const MIN_TIME_BETWEEN_SCALE: Duration = Duration::from_secs(300);
+const PERSISTENCE_SCHEMA_VERSION: u32 = 1;
 
-use crate::types::{Opportunity, Strategy};
+use crate::types::{ExecutionMode, Opportunity, Strategy};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LeverageConfig {
@@ -91,16 +95,19 @@ impl RiskConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("falha ao ler {path}: {e}"))?;
-        let cfg: RiskConfig = toml::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("falha ao parsear {path}: {e}"))?;
+        let cfg: RiskConfig =
+            toml::from_str(&raw).map_err(|e| anyhow::anyhow!("falha ao parsear {path}: {e}"))?;
+        if (cfg.protected_reserve_pct + cfg.reinvest_pct - 1.0).abs() > 1e-9 {
+            anyhow::bail!("protected_reserve_pct + reinvest_pct precisa somar 1.0");
+        }
+        if cfg.rare_event_reserve_pct + cfg.rare_event_infra_pct > 1.0 {
+            anyhow::bail!("reservas de evento raro não podem exceder 100% do lucro");
+        }
         Ok(cfg)
     }
 
     fn strategy_limit_pct(&self, strategy: Strategy) -> f64 {
-        *self
-            .strategy_risk_pct
-            .get(strategy.key())
-            .unwrap_or(&0.0)
+        *self.strategy_risk_pct.get(strategy.key()).unwrap_or(&0.0)
     }
 }
 
@@ -114,10 +121,8 @@ pub enum TradeOutcome {
 pub struct PortfolioState {
     pub equity: f64,
     pub protected_reserve: f64,
-    /// Fatia de 10% do lucro de eventos raros reservada pro conceito de
-    /// "infraestrutura e custos" do PDF. Em paper trading não existe custo
-    /// real pra pagar, então isso só fica separado e visível — não é
-    /// gasto automaticamente em nada.
+    /// Fatia de lucro de eventos raros reservada para infraestrutura. O
+    /// executor atual não é evento raro; o campo preserva o modelo futuro.
     pub infra_reserve: f64,
     pub peak_equity: f64,
     /// Equity no início do dia/semana UTC corrente — base dos dois
@@ -163,8 +168,7 @@ pub struct PortfolioState {
     /// Achado ao vivo (13/08/2026, pedido do usuário: "o que falta pra ser
     /// 100% real em regras/validações?"): filtros reais de lote/notional
     /// mínimo por símbolo, buscados uma vez no boot da API pública da
-    /// própria exchange (Bybit `instruments-info`, Bitget
-    /// `spot/public/symbols`) — sem isso, uma ordem simulada podia ter
+    /// própria exchange (Bybit `instruments-info`) — sem isso, uma ordem simulada podia ter
     /// tamanho que a exchange de verdade rejeitaria. Não persiste (dado de
     /// mercado, não capital — refaz no boot).
     pub symbol_filters: HashMap<String, SymbolFilter>,
@@ -190,6 +194,7 @@ pub struct SymbolFilter {
     pub min_qty: f64,
     pub qty_step: f64,
     pub min_notional: f64,
+    pub price_tick: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -282,10 +287,20 @@ struct PersistedState {
     leg_size: f64,
     total_cycles: u64,
     #[serde(default)]
-    strategy_scaling: HashMap<String, StrategyScalingPersisted>,
+    strategy_scaling: BTreeMap<String, StrategyScalingPersisted>,
     wins: u64,
     losses: u64,
     rejections: u64,
+}
+
+/// Envelope autenticado do estado local. O checksum detecta escrita parcial,
+/// edição acidental e corrupção silenciosa antes que números inválidos sejam
+/// usados pelo motor de risco.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedEnvelope {
+    schema_version: u32,
+    checksum_sha256: String,
+    state: PersistedState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -339,25 +354,41 @@ impl PortfolioState {
             .unwrap_or(0.0)
     }
 
-    /// Tenta recuperar o estado salvo em `path`; se não existir ou estiver
-    /// corrompido, começa do zero normalmente (não é um erro fatal — é
-    /// exatamente o que aconteceria na primeiríssima vez que o processo
-    /// roda). Isso é o que evita o equity voltar pra US$200 toda vez que o
-    /// processo reinicia (pra aplicar código novo, por exemplo).
+    /// Recupera o estado principal ou, se ele estiver ausente/corrompido, o
+    /// último backup válido. Só começa do zero quando nenhum dos dois existe
+    /// ou passa nas validações de integridade.
     pub fn load_or_new(cfg: &RiskConfig, path: &str) -> Self {
         let fresh = Self::new(cfg);
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            tracing::info!(path, "nenhum estado salvo encontrado, começando do zero");
-            return fresh;
-        };
-        // Alguns editores/ferramentas no Windows salvam JSON com um BOM
-        // UTF-8 na frente, que não é whitespace válido pra um parser JSON
-        // estrito — tira isso antes de tentar, em vez de descartar um
-        // estado bom só por causa de 3 bytes invisíveis.
-        let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-        let Ok(persisted) = serde_json::from_str::<PersistedState>(raw) else {
-            tracing::warn!(path, "estado salvo corrompido ou de formato antigo, começando do zero");
-            return fresh;
+        let primary = Path::new(path);
+        let backup = sibling_path(primary, ".prev");
+
+        let persisted = match read_persisted_state(primary) {
+            Ok(state) => state,
+            Err(primary_error) => match read_persisted_state(&backup) {
+                Ok(state) => {
+                    tracing::warn!(
+                        path,
+                        backup = %backup.display(),
+                        error = %primary_error,
+                        "estado principal indisponível; recuperando último backup válido"
+                    );
+                    state
+                }
+                Err(backup_error) => {
+                    if primary.exists() || backup.exists() {
+                        tracing::error!(
+                            path,
+                            backup = %backup.display(),
+                            primary_error = %primary_error,
+                            backup_error = %backup_error,
+                            "nenhum estado válido disponível; iniciando com a configuração"
+                        );
+                    } else {
+                        tracing::info!(path, "nenhum estado salvo encontrado, começando do zero");
+                    }
+                    return fresh;
+                }
+            },
         };
         tracing::info!(
             equity = persisted.equity,
@@ -424,9 +455,9 @@ impl PortfolioState {
         }
     }
 
-    /// Chamado depois de cada trade — o custo de um `write` a cada operação
-    /// é desprezível no volume que este sistema opera, e garante que nunca
-    /// perdemos mais que a última operação em caso de queda abrupta.
+    /// Chamado depois de cada trade. Grava e sincroniza um temporário, move o
+    /// estado anterior para `.prev` e só então promove o novo estado. Assim,
+    /// uma queda durante a escrita ainda deixa pelo menos uma cópia íntegra.
     pub fn save(&self, path: &str) {
         let persisted = PersistedState {
             equity: self.equity,
@@ -468,16 +499,12 @@ impl PortfolioState {
             losses: self.losses,
             rejections: self.rejections,
         };
-        let Ok(json) = serde_json::to_string_pretty(&persisted) else { return };
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = std::fs::write(path, json) {
+        if let Err(e) = write_persisted_state(Path::new(path), &persisted) {
             tracing::warn!(path, error = %e, "falha ao salvar estado do portfólio em disco");
         }
     }
 
-    fn total_exposure(&self) -> f64 {
+    pub(crate) fn total_exposure(&self) -> f64 {
         self.exposure_by_strategy.values().sum()
     }
 
@@ -501,6 +528,138 @@ impl PortfolioState {
         }
         ((self.week_start_equity - self.equity) / self.week_start_equity).max(0.0)
     }
+}
+
+fn persisted_checksum(state: &PersistedState) -> Result<String, String> {
+    let bytes = serde_json::to_vec(state).map_err(|e| format!("serialização do checksum: {e}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn persisted_state_is_valid(state: &PersistedState) -> bool {
+    let nonnegative = [
+        state.equity,
+        state.protected_reserve,
+        state.infra_reserve,
+        state.peak_equity,
+        state.day_start_equity,
+        state.week_start_equity,
+        state.leg_size,
+    ]
+    .iter()
+    .all(|value| value.is_finite() && *value >= 0.0);
+
+    nonnegative
+        && state.peak_equity > 0.0
+        && state.strategy_scaling.values().all(|scaling| {
+            scaling.leg_size.is_finite()
+                && scaling.leg_size >= 0.0
+                && scaling.cumulative_pnl.is_finite()
+                && scaling.peak_cumulative_pnl.is_finite()
+                && scaling.trough_since_peak.is_finite()
+        })
+}
+
+fn decode_persisted_state(raw: &str) -> Result<PersistedState, String> {
+    // Alguns editores/ferramentas no Windows salvam JSON com um BOM UTF-8.
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+
+    if let Ok(envelope) = serde_json::from_str::<PersistedEnvelope>(raw) {
+        if envelope.schema_version != PERSISTENCE_SCHEMA_VERSION {
+            return Err(format!("schema não suportado: {}", envelope.schema_version));
+        }
+        let expected = persisted_checksum(&envelope.state)?;
+        if expected != envelope.checksum_sha256 {
+            return Err("checksum SHA-256 divergente".to_string());
+        }
+        if !persisted_state_is_valid(&envelope.state) {
+            return Err("estado contém valor financeiro inválido".to_string());
+        }
+        return Ok(envelope.state);
+    }
+
+    // Migração transparente do JSON legado, anterior ao envelope v1.
+    let state = serde_json::from_str::<PersistedState>(raw)
+        .map_err(|e| format!("JSON inválido ou formato desconhecido: {e}"))?;
+    if !persisted_state_is_valid(&state) {
+        return Err("estado legado contém valor financeiro inválido".to_string());
+    }
+    Ok(state)
+}
+
+fn read_persisted_state(path: &Path) -> Result<PersistedState, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("não foi possível ler {}: {e}", path.display()))?;
+    decode_persisted_state(&raw)
+}
+
+pub(crate) fn has_recoverable_portfolio_state(path: &str) -> bool {
+    let primary = Path::new(path);
+    read_persisted_state(primary).is_ok()
+        || read_persisted_state(&sibling_path(primary, ".prev")).is_ok()
+}
+
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn write_persisted_state(path: &Path, state: &PersistedState) -> Result<(), String> {
+    let envelope = PersistedEnvelope {
+        schema_version: PERSISTENCE_SCHEMA_VERSION,
+        checksum_sha256: persisted_checksum(state)?,
+        state: state.clone(),
+    };
+    let json = serde_json::to_vec_pretty(&envelope)
+        .map_err(|e| format!("não foi possível serializar o estado: {e}"))?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("não foi possível criar {}: {e}", parent.display()))?;
+    }
+
+    let temporary = sibling_path(path, ".tmp");
+    let backup = sibling_path(path, ".prev");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|e| format!("não foi possível abrir {}: {e}", temporary.display()))?;
+    file.write_all(&json)
+        .map_err(|e| format!("não foi possível escrever {}: {e}", temporary.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("não foi possível sincronizar {}: {e}", temporary.display()))?;
+    drop(file);
+
+    if path.exists() {
+        if backup.exists() {
+            std::fs::remove_file(&backup)
+                .map_err(|e| format!("não foi possível remover {}: {e}", backup.display()))?;
+        }
+        std::fs::rename(path, &backup).map_err(|e| {
+            format!(
+                "não foi possível mover {} para {}: {e}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+    }
+
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        // Se a promoção falhar depois de mover o primário, restaura a cópia
+        // anterior para manter o caminho principal utilizável.
+        if backup.exists() && !path.exists() {
+            let _ = std::fs::rename(&backup, path);
+        }
+        return Err(format!(
+            "não foi possível promover {} para {}: {error}",
+            temporary.display(),
+            path.display()
+        ));
+    }
+
+    Ok(())
 }
 
 fn today_epoch_day() -> i64 {
@@ -545,7 +704,12 @@ pub struct KillSwitchStatus {
 /// — ver Seção 3 do roadmap); se/quando o sistema passar a manter posições
 /// reais abertas, este kill-switch precisa ganhar lógica de
 /// neutralizar/fechar posição, não só bloquear ordem nova.
-pub fn kill_switch_reason(portfolio: &mut PortfolioState, cfg: &RiskConfig, kill_file_path: &str, reset_drawdown_file_path: &str) -> KillSwitchStatus {
+pub fn kill_switch_reason(
+    portfolio: &mut PortfolioState,
+    cfg: &RiskConfig,
+    kill_file_path: &str,
+    reset_drawdown_file_path: &str,
+) -> KillSwitchStatus {
     let today = today_epoch_day();
     if portfolio.day_start_epoch_day != today {
         portfolio.day_start_epoch_day = today;
@@ -558,7 +722,12 @@ pub fn kill_switch_reason(portfolio: &mut PortfolioState, cfg: &RiskConfig, kill
     }
 
     if std::path::Path::new(kill_file_path).exists() {
-        return KillSwitchStatus { halt: Some(format!("kill-switch manual ativo ({kill_file_path} existe)")), warn: None };
+        return KillSwitchStatus {
+            halt: Some(format!(
+                "kill-switch manual ativo ({kill_file_path} existe)"
+            )),
+            warn: None,
+        };
     }
 
     // Nível mais grave (drawdown total desde o pico) é "trava", não
@@ -570,7 +739,14 @@ pub fn kill_switch_reason(portfolio: &mut PortfolioState, cfg: &RiskConfig, kill
         if std::path::Path::new(reset_drawdown_file_path).exists() {
             let _ = std::fs::remove_file(reset_drawdown_file_path);
             portfolio.total_drawdown_latched = false;
-            tracing::warn!("drawdown total: trava removida manualmente, retomando avaliação normal");
+            // O reset é a aceitação explícita de uma nova linha de base.
+            // Sem atualizar o pico, o mesmo drawdown ainda existe e a
+            // trava seria acionada novamente algumas linhas abaixo.
+            portfolio.peak_equity = portfolio.equity;
+            tracing::warn!(
+                equity = portfolio.equity,
+                "drawdown total: trava removida e nova linha de base registrada"
+            );
         } else {
             return KillSwitchStatus {
                 halt: Some(format!(
@@ -593,7 +769,11 @@ pub fn kill_switch_reason(portfolio: &mut PortfolioState, cfg: &RiskConfig, kill
     let weekly_dd = portfolio.weekly_drawdown_pct();
     if weekly_dd >= cfg.weekly_halt_pct {
         return KillSwitchStatus {
-            halt: Some(format!("drawdown semanal de {:.2}% >= limite de {:.2}%", weekly_dd * 100.0, cfg.weekly_halt_pct * 100.0)),
+            halt: Some(format!(
+                "drawdown semanal de {:.2}% >= limite de {:.2}%",
+                weekly_dd * 100.0,
+                cfg.weekly_halt_pct * 100.0
+            )),
             warn: None,
         };
     }
@@ -601,7 +781,11 @@ pub fn kill_switch_reason(portfolio: &mut PortfolioState, cfg: &RiskConfig, kill
     let daily_dd = portfolio.daily_drawdown_pct();
     if daily_dd >= cfg.daily_halt_pct {
         return KillSwitchStatus {
-            halt: Some(format!("drawdown diario de {:.2}% >= limite de {:.2}%", daily_dd * 100.0, cfg.daily_halt_pct * 100.0)),
+            halt: Some(format!(
+                "drawdown diario de {:.2}% >= limite de {:.2}%",
+                daily_dd * 100.0,
+                cfg.daily_halt_pct * 100.0
+            )),
             warn: None,
         };
     }
@@ -612,22 +796,31 @@ pub fn kill_switch_reason(portfolio: &mut PortfolioState, cfg: &RiskConfig, kill
         };
     }
 
-    KillSwitchStatus { halt: None, warn: None }
+    KillSwitchStatus {
+        halt: None,
+        warn: None,
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Approved {
     pub order_size: f64,
+    /// Quantidade do contrato já arredondada pelo `qtyStep` da Bybit.
+    pub order_qty: f64,
+    /// Incremento mínimo de preço usado pelo stop protetor na venue.
+    pub price_tick: f64,
     pub capital_at_risk: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RejectReason {
+    /// Só a estratégia de microestrutura da Bybit, com cotação shadow
+    /// vinculada por `signal_id`, pode reservar capital.
+    ExecutionDisabled,
     Expired,
     StrategyLimitExceeded,
     TotalLimitExceeded,
     CorrelationGroupBusy,
-    NoLeverageOnLaunch,
     LeverageTooHigh,
     MartingaleBlocked,
     /// Achado ao vivo (13/08/2026): uma conta de varejo real tem limite de
@@ -636,18 +829,17 @@ pub enum RejectReason {
     /// isso. Token bucket por venue (ver `strategy_venues`/
     /// `rate_limit_available`).
     RateLimited,
-    /// Ordem abaixo do notional/quantidade mínima REAL daquele símbolo
-    /// naquela exchange (buscado da própria API pública — `minOrderAmt` na
-    /// Bybit, `minTradeUSDT` na Bitget). Uma exchange de verdade rejeitaria
-    /// essa ordem; antes disso nada verificava.
+    /// Ordem abaixo do notional/quantidade mínima real da Bybit.
     BelowExchangeMinimum,
-    /// Trava estrutural do Launch Radar (task #88) — ver
-    /// `LAUNCH_TRADE_ENABLED`.
-    LaunchTradingDisabled,
+    /// Sem os filtros públicos atuais da Bybit, o sistema não sabe se a
+    /// quantidade seria aceita e, portanto, falha fechado.
+    MissingExchangeFilter,
     /// Teto global de alavancagem do portfólio inteiro (task #89) —
-    /// diferente de `NoLeverageOnLaunch`/`LeverageTooHigh`, que só olham a
-    /// alavancagem de UMA oportunidade isolada. Este soma o notional
-    /// alavancado de TODAS as posições já abertas.
+    /// diferente de `LeverageTooHigh`, que só olha a alavancagem de UMA
+    /// oportunidade isolada. Este soma o notional alavancado de TODAS as
+    /// posições já abertas. (A trava independente que existia para Launch,
+    /// `NoLeverageOnLaunch`, foi removida — ver `leverage.launch_max` em
+    /// risk.toml.)
     GlobalLeverageExceeded,
 }
 
@@ -658,21 +850,6 @@ pub enum RejectReason {
 /// máximo que o sistema aceita não pode depender só dele.
 const ABSOLUTE_LEVERAGE_CEILING: f64 = 2.0;
 
-/// Trava estrutural do Launch Radar (task #88, auditoria externa
-/// 13/08/2026: "defesa em profundidade"). Hoje o Launch Radar (CEX+DEX)
-/// nunca executa porque `net_edge` fica hardcoded em 0.0 nos dois módulos
-/// (`launch_radar.rs`/`dex_launch_radar.rs`), o que zera `opp.score()` e é
-/// filtrado antes mesmo de chegar aqui (ver `pick_best` em
-/// orchestrator.rs) — mas esse é o ÚNICO motivo, e é fácil de mudar sem
-/// querer (bastaria alguém implementar uma camada de edge real pro Launch
-/// Radar, como já foi feito pra Order Flow/Arbitragem/Pump Exhaustion,
-/// pra reabilitar execução sem nenhuma decisão consciente sobre isso).
-/// Lançamento de token é o contexto de MENOR liquidez/confiabilidade de
-/// livro do sistema inteiro — merece um segundo trava independente, não
-/// só depender do score ficar zerado. Mude pra `true` só com decisão
-/// explícita, não como efeito colateral de outra mudança.
-const LAUNCH_TRADE_ENABLED: bool = false;
-
 /// Quais exchanges (venues) uma estratégia realmente usa pra executar —
 /// usado tanto pro rate limiter quanto, no futuro, pra checar filtros por
 /// símbolo em cada uma. Estratégias que ainda não executam trade nenhum
@@ -681,10 +858,13 @@ const LAUNCH_TRADE_ENABLED: bool = false;
 fn strategy_venues(strategy: Strategy) -> &'static [&'static str] {
     match strategy {
         Strategy::OrderFlow => &["bybit"],
-        Strategy::Arbitrage => &["bybit", "bitget"],
-        Strategy::PumpExhaustion | Strategy::LiquidationHunter | Strategy::Launch => &["bybit"],
-        Strategy::MultiAsset => &["alpaca"],
-        Strategy::WhaleWatch | Strategy::News | Strategy::Macro => &[],
+        Strategy::WhaleWatch
+        | Strategy::FundingCarry
+        | Strategy::News
+        | Strategy::PumpExhaustion
+        | Strategy::Macro
+        | Strategy::Launch
+        | Strategy::LiquidationHunter => &[],
     }
 }
 
@@ -700,7 +880,8 @@ const VENUE_RATE_LIMIT_BURST: f64 = 8.0;
 /// sem que o candidato necessariamente vença e execute.
 fn rate_limit_available(portfolio: &PortfolioState, venue: &str) -> bool {
     let tokens = match portfolio.venue_rate_limiters.get(venue) {
-        Some(s) => (s.tokens + s.last_refill.elapsed().as_secs_f64() * VENUE_RATE_LIMIT_PER_SEC).min(VENUE_RATE_LIMIT_BURST),
+        Some(s) => (s.tokens + s.last_refill.elapsed().as_secs_f64() * VENUE_RATE_LIMIT_PER_SEC)
+            .min(VENUE_RATE_LIMIT_BURST),
         None => VENUE_RATE_LIMIT_BURST,
     };
     tokens >= 1.0
@@ -715,7 +896,10 @@ pub fn consume_rate_limit(portfolio: &mut PortfolioState, strategy: Strategy) {
         let state = portfolio
             .venue_rate_limiters
             .entry(venue.to_string())
-            .or_insert_with(|| RateLimiterState { tokens: VENUE_RATE_LIMIT_BURST, last_refill: now });
+            .or_insert_with(|| RateLimiterState {
+                tokens: VENUE_RATE_LIMIT_BURST,
+                last_refill: now,
+            });
         let refill = state.last_refill.elapsed().as_secs_f64() * VENUE_RATE_LIMIT_PER_SEC;
         state.tokens = (state.tokens + refill).min(VENUE_RATE_LIMIT_BURST);
         state.last_refill = now;
@@ -735,9 +919,31 @@ pub fn consume_rate_limit(portfolio: &mut PortfolioState, strategy: Strategy) {
 /// zerada — nunca bloqueavam por excesso de exposição SIMULTÂNEA, só por
 /// um único trade grande demais sozinho.
 pub fn open_exposure(portfolio: &mut PortfolioState, opp: &Opportunity, approved: &Approved) {
-    *portfolio.exposure_by_strategy.entry(opp.strategy).or_insert(0.0) += approved.capital_at_risk;
-    *portfolio.exposure_by_group.entry(opp.correlation_group.clone()).or_insert(0.0) += approved.capital_at_risk;
-    portfolio.total_leveraged_notional += approved.order_size * opp.leverage;
+    *portfolio
+        .exposure_by_strategy
+        .entry(opp.strategy)
+        .or_insert(0.0) += approved.capital_at_risk;
+    *portfolio
+        .exposure_by_group
+        .entry(opp.correlation_group.clone())
+        .or_insert(0.0) += approved.capital_at_risk;
+    portfolio.total_leveraged_notional +=
+        approved.order_size * opp.leverage * opp.capital_multiplier;
+}
+
+/// Libera uma reserva sem fabricar um trade. Usado quando o executor
+/// shadow informa que não houve cotação executável ou quando a confirmação
+/// expira sem resposta. Unfilled não altera equity, wins/losses ou Kelly.
+pub fn cancel_exposure(portfolio: &mut PortfolioState, opp: &Opportunity, approved: &Approved) {
+    if let Some(e) = portfolio.exposure_by_strategy.get_mut(&opp.strategy) {
+        *e = (*e - approved.capital_at_risk).max(0.0);
+    }
+    if let Some(e) = portfolio.exposure_by_group.get_mut(&opp.correlation_group) {
+        *e = (*e - approved.capital_at_risk).max(0.0);
+    }
+    portfolio.total_leveraged_notional = (portfolio.total_leveraged_notional
+        - approved.order_size * opp.leverage * opp.capital_multiplier)
+        .max(0.0);
 }
 
 /// Avalia uma oportunidade contra o estado atual do portfólio e os limites
@@ -748,17 +954,15 @@ pub fn evaluate(
     portfolio: &PortfolioState,
     cfg: &RiskConfig,
 ) -> Result<Approved, RejectReason> {
+    if opp.execution_mode != ExecutionMode::ExecutableQuoted || opp.strategy != Strategy::OrderFlow
+    {
+        return Err(RejectReason::ExecutionDisabled);
+    }
+
     if opp.is_expired() {
         return Err(RejectReason::Expired);
     }
 
-    if opp.strategy == Strategy::Launch && !LAUNCH_TRADE_ENABLED {
-        return Err(RejectReason::LaunchTradingDisabled);
-    }
-
-    if opp.strategy == Strategy::Launch && opp.leverage > cfg.leverage.launch_max {
-        return Err(RejectReason::NoLeverageOnLaunch);
-    }
     if opp.leverage > cfg.leverage.liquid_max {
         return Err(RejectReason::LeverageTooHigh);
     }
@@ -779,7 +983,40 @@ pub fn evaluate(
     let leg_size = portfolio.leg_size(opp.strategy)
         * drawdown_ceiling_multiplier(portfolio.drawdown_pct())
         * symbol_fraction;
-    let order_size = opp.capital_needed.min(leg_size);
+    let mut order_size = opp.capital_needed.min(leg_size);
+    let mut order_qty = 0.0;
+    let mut price_tick = 0.0;
+
+    // Converte o notional em quantidade usando o preço da oportunidade e
+    // arredonda para baixo no qtyStep real da venue. Assim o paper não
+    // aprova uma quantidade que a corretora rejeitaria.
+    for &venue in strategy_venues(opp.strategy) {
+        let key = format!("{venue}:{}", opp.base_symbol());
+        let Some(filter) = portfolio.symbol_filters.get(&key) else {
+            return Err(RejectReason::MissingExchangeFilter);
+        };
+        let Some(price) = opp.reference_price.filter(|price| *price > 0.0) else {
+            return Err(RejectReason::MissingExchangeFilter);
+        };
+        let raw_qty = order_size / price;
+        let rounded_qty = if filter.qty_step > 0.0 {
+            (raw_qty / filter.qty_step).floor() * filter.qty_step
+        } else {
+            raw_qty
+        };
+        if filter.min_qty > 0.0 && rounded_qty < filter.min_qty {
+            return Err(RejectReason::BelowExchangeMinimum);
+        }
+        order_qty = rounded_qty;
+        price_tick = filter.price_tick;
+        if price_tick <= 0.0 {
+            return Err(RejectReason::MissingExchangeFilter);
+        }
+        order_size = rounded_qty * price;
+        if filter.min_notional > 0.0 && order_size < filter.min_notional {
+            return Err(RejectReason::BelowExchangeMinimum);
+        }
+    }
 
     // Nunca aumentar o tamanho da ordem em uma estratégia logo após uma
     // perda — mas comparado contra a perna BASE da estratégia
@@ -834,30 +1071,11 @@ pub fn evaluate(
         return Err(RejectReason::CorrelationGroupBusy);
     }
 
-    // Rate limit real por venue — uma conta de varejo não consegue
-    // submeter ordem ilimitadamente rápido. Checa TODAS as venues que a
-    // estratégia usa (arbitragem precisa das duas, já que as duas pernas
-    // são ordens reais separadas).
+    // Rate limit da única venue. Mesmo em shadow, manter este limite evita
+    // validar uma cadência que uma conta de varejo não conseguiria enviar.
     for &venue in strategy_venues(opp.strategy) {
         if !rate_limit_available(portfolio, venue) {
             return Err(RejectReason::RateLimited);
-        }
-    }
-
-    // Notional mínimo real por símbolo/venue (buscado da própria API
-    // pública da exchange — ver `main.rs`/`symbol_universe.rs` e
-    // `SymbolFilter`). Só valida notional (USD, comparável direto com
-    // `order_size`) — quantidade mínima/passo exigiriam o preço atual, que
-    // não chega até aqui; fica como lacuna documentada, não escondida.
-    // Se o filtro ainda não foi buscado pra esse símbolo/venue, não
-    // bloqueia (falha aberta) — melhor não travar tudo por uma busca
-    // incompleta do que fingir que validou algo que não validou.
-    for &venue in strategy_venues(opp.strategy) {
-        let key = format!("{venue}:{}", opp.base_symbol());
-        if let Some(filter) = portfolio.symbol_filters.get(&key) {
-            if filter.min_notional > 0.0 && order_size < filter.min_notional {
-                return Err(RejectReason::BelowExchangeMinimum);
-            }
         }
     }
 
@@ -870,7 +1088,8 @@ pub fn evaluate(
     // profundidade contra config mal ajustada.
     if portfolio.equity > 0.0 {
         let effective_cap = cfg.leverage.global_max.min(ABSOLUTE_LEVERAGE_CEILING);
-        let projected_notional = portfolio.total_leveraged_notional + order_size * opp.leverage;
+        let projected_notional =
+            portfolio.total_leveraged_notional + order_size * opp.leverage * opp.capital_multiplier;
         if projected_notional / portfolio.equity > effective_cap {
             return Err(RejectReason::GlobalLeverageExceeded);
         }
@@ -878,6 +1097,8 @@ pub fn evaluate(
 
     Ok(Approved {
         order_size,
+        order_qty,
+        price_tick,
         capital_at_risk,
     })
 }
@@ -949,7 +1170,9 @@ pub fn record_trade_result(
     if let Some(e) = portfolio.exposure_by_group.get_mut(&opp.correlation_group) {
         *e = (*e - approved.capital_at_risk).max(0.0);
     }
-    portfolio.total_leveraged_notional = (portfolio.total_leveraged_notional - approved.order_size * opp.leverage).max(0.0);
+    portfolio.total_leveraged_notional = (portfolio.total_leveraged_notional
+        - approved.order_size * opp.leverage * opp.capital_multiplier)
+        .max(0.0);
 
     portfolio
         .last_outcome_by_strategy
@@ -1011,9 +1234,17 @@ fn recent_profit_factor(recent_pnls: &VecDeque<f64>, min_samples: usize) -> Opti
         return None;
     }
     let gains: f64 = recent_pnls.iter().filter(|&&p| p > 0.0).sum();
-    let losses: f64 = recent_pnls.iter().filter(|&&p| p < 0.0).map(|p| p.abs()).sum();
+    let losses: f64 = recent_pnls
+        .iter()
+        .filter(|&&p| p < 0.0)
+        .map(|p| p.abs())
+        .sum();
     if losses <= 0.0 {
-        return if gains > 0.0 { Some(f64::INFINITY) } else { None };
+        return if gains > 0.0 {
+            Some(f64::INFINITY)
+        } else {
+            None
+        };
     }
     Some(gains / losses)
 }
@@ -1027,36 +1258,12 @@ fn positive_excluding_best_trade(recent_pnls: &VecDeque<f64>, min_samples: usize
     if recent_pnls.len() < min_samples {
         return None;
     }
-    let best = recent_pnls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let best = recent_pnls
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
     let total: f64 = recent_pnls.iter().sum();
     Some(total - best.max(0.0) > 0.0)
-}
-
-/// Reduz a perna de TODAS as estratégias pela metade — usado só pelo aviso
-/// preventivo de drawdown DIÁRIO (transição única, guardada em
-/// orchestrator.rs por `is_warned != was_warned`, nunca chamada a cada
-/// trade). O gatilho por drawdown desde o pico histórico usava isto
-/// também até 12/08/2026, mas era chamado a cada trade enquanto o
-/// drawdown ficasse acima do limiar — reduzindo repetidas vezes até o
-/// piso; substituído por `drawdown_ceiling_multiplier` (não-destrutivo,
-/// função pura do drawdown atual, ver `evaluate()`).
-pub fn halve_all_legs(portfolio: &mut PortfolioState) -> Vec<ScaleEvent> {
-    let mut events = Vec::new();
-    for (&strategy, scaling) in portfolio.strategy_scaling.iter_mut() {
-        let old_size = scaling.leg_size;
-        let new_size = (old_size / 2.0).max(1.0);
-        scaling.cycles_since_scale = 0;
-        if new_size < old_size {
-            scaling.leg_size = new_size;
-            events.push(ScaleEvent {
-                strategy: Some(strategy),
-                old_size,
-                new_size,
-                direction: ScaleDirection::Decrease,
-            });
-        }
-    }
-    events
 }
 
 // Escada de recuperação de drawdown (auditoria externa, 12/08/2026).
@@ -1066,11 +1273,11 @@ pub fn halve_all_legs(portfolio: &mut PortfolioState) -> Vec<ScaleEvent> {
 const DRAWDOWN_CEILING_TIER_1: f64 = 0.0175; // acima disto: metade
 const DRAWDOWN_CEILING_TIER_2: f64 = 0.015; // abaixo de 1,75%: 65%
 const DRAWDOWN_CEILING_TIER_3: f64 = 0.01; // abaixo de 1,50%: 80%
-// abaixo de 1%: sem teto (100%)
+                                           // abaixo de 1%: sem teto (100%)
 
 /// Teto NÃO-DESTRUTIVO sobre o tamanho efetivo da ordem, em função do
 /// drawdown ATUAL do portfólio — substitui a antiga mutação repetida de
-/// `leg_size` via `halve_all_legs` a cada trade. Por ser uma função pura
+/// `leg_size` a cada trade. Por ser uma função pura
 /// recalculada do zero a cada chamada (nunca acumula, nunca precisa de
 /// "já reduzi essa vez?"), relaxa sozinha assim que o portfólio recupera,
 /// sem exigir lógica de recuperação separada nem estado extra.
@@ -1116,7 +1323,12 @@ fn wilson_lower_bound(wins: f64, total: f64) -> f64 {
 /// "sem vantagem aqui ainda", não um caso de fallback silencioso.
 fn kelly_fraction_from_pnls(recent_pnls: &VecDeque<f64>) -> Option<f64> {
     let wins: Vec<f64> = recent_pnls.iter().copied().filter(|&p| p > 0.0).collect();
-    let losses: Vec<f64> = recent_pnls.iter().copied().filter(|&p| p < 0.0).map(f64::abs).collect();
+    let losses: Vec<f64> = recent_pnls
+        .iter()
+        .copied()
+        .filter(|&p| p < 0.0)
+        .map(f64::abs)
+        .collect();
     if wins.is_empty() || losses.is_empty() {
         return None;
     }
@@ -1194,11 +1406,7 @@ fn raw_symbol_kelly_ratio(sym: &SymbolScaling, strategy_kelly: f64) -> Option<f6
 /// frações concorrentes converge pra ~N (a mesma verba total de antes),
 /// só redistribuída conforme o Kelly relativo de cada um, em vez de cada
 /// símbolo requisitar até 2x de forma independente.
-fn symbol_allocation_fraction(
-    portfolio: &PortfolioState,
-    strategy: Strategy,
-    symbol: &str,
-) -> f64 {
+fn symbol_allocation_fraction(portfolio: &PortfolioState, strategy: Strategy, symbol: &str) -> f64 {
     let Some(strategy_kelly) = portfolio
         .strategy_scaling
         .get(&strategy)
@@ -1210,7 +1418,10 @@ fn symbol_allocation_fraction(
         return 1.0; // sem baseline confiável da estratégia — não penaliza nem infla
     }
 
-    let Some(sym) = portfolio.symbol_scaling.get(&(strategy, symbol.to_string())) else {
+    let Some(sym) = portfolio
+        .symbol_scaling
+        .get(&(strategy, symbol.to_string()))
+    else {
         return 1.0;
     };
     let Some(target_raw) = raw_symbol_kelly_ratio(sym, strategy_kelly) else {
@@ -1223,8 +1434,16 @@ fn symbol_allocation_fraction(
         .filter(|((s, _), _)| *s == strategy)
         .filter_map(|(_, sc)| raw_symbol_kelly_ratio(sc, strategy_kelly))
         .collect();
-    let peer_avg = if peers.is_empty() { 1.0 } else { peers.iter().sum::<f64>() / peers.len() as f64 };
-    let normalized = if peer_avg > 0.0 { target_raw / peer_avg } else { target_raw };
+    let peer_avg = if peers.is_empty() {
+        1.0
+    } else {
+        peers.iter().sum::<f64>() / peers.len() as f64
+    };
+    let normalized = if peer_avg > 0.0 {
+        target_raw / peer_avg
+    } else {
+        target_raw
+    };
 
     normalized.clamp(SYMBOL_ALLOCATION_MIN, SYMBOL_ALLOCATION_MAX)
 }
@@ -1257,7 +1476,11 @@ const MIN_DISTINCT_SYMBOLS_FOR_SCALE: usize = 2;
 /// tamanha pelo Kelly fracionário medido (task #99), com fallback pro
 /// degrau fixo antigo só quando a amostra ainda não dá pra estimar Kelly
 /// (ex.: só vitórias até agora).
-fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strategy) -> Vec<ScaleEvent> {
+fn maybe_scale(
+    portfolio: &mut PortfolioState,
+    cfg: &RiskConfig,
+    strategy: Strategy,
+) -> Vec<ScaleEvent> {
     portfolio.peak_equity = portfolio.peak_equity.max(portfolio.equity);
     let drawdown = portfolio.drawdown_pct();
 
@@ -1279,11 +1502,15 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
     // Calculado ANTES do borrow mutável de `scaling` abaixo — olha outros
     // campos do portfolio (exposição, símbolos), não o de escalonamento.
     let strategy_limit = cfg.strategy_limit_pct(strategy) * equity;
-    let current_exposure = *portfolio.exposure_by_strategy.get(&strategy).unwrap_or(&0.0);
+    let current_exposure = *portfolio
+        .exposure_by_strategy
+        .get(&strategy)
+        .unwrap_or(&0.0);
     // Orçamento de risco livre: não adianta aumentar a perna se a
     // estratégia já está usando a maior parte do limite dela — o tamanho
     // maior não teria onde caber na exposição livre agora mesmo.
-    let free_budget_ok = strategy_limit <= 0.0 || current_exposure <= strategy_limit * MAX_EXPOSURE_UTILIZATION_FOR_SCALE;
+    let free_budget_ok = strategy_limit <= 0.0
+        || current_exposure <= strategy_limit * MAX_EXPOSURE_UTILIZATION_FOR_SCALE;
     // Concentração: exige que o lucro recente venha de mais de um símbolo
     // — Kelly medido em cima de um único símbolo é sorte daquele símbolo
     // específico, não vantagem repetível da estratégia. `== 0` (nenhuma
@@ -1294,7 +1521,8 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
         .iter()
         .filter(|((s, _), sc)| *s == strategy && !sc.recent_pnls.is_empty())
         .count();
-    let not_overconcentrated = distinct_symbols == 0 || distinct_symbols >= MIN_DISTINCT_SYMBOLS_FOR_SCALE;
+    let not_overconcentrated =
+        distinct_symbols == 0 || distinct_symbols >= MIN_DISTINCT_SYMBOLS_FOR_SCALE;
 
     let Some(scaling) = portfolio.strategy_scaling.get_mut(&strategy) else {
         return Vec::new();
@@ -1314,7 +1542,8 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
     let recovered = if peak_to_trough <= 0.0 {
         true
     } else {
-        let recovered_fraction = 1.0 - (scaling.peak_cumulative_pnl - scaling.cumulative_pnl) / peak_to_trough;
+        let recovered_fraction =
+            1.0 - (scaling.peak_cumulative_pnl - scaling.cumulative_pnl) / peak_to_trough;
         recovered_fraction >= cfg.scaling.partial_recovery_fraction
     };
 
@@ -1332,8 +1561,15 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
     // sobre si mesmo (ver comentário de MIN_TIME_BETWEEN_SCALE), e sem
     // ela uma redução ativa correria o mesmo risco de colapso repetido
     // que já aconteceu com o antigo `halve_all_legs` por trade.
-    let profit_factor = recent_profit_factor(&scaling.recent_pnls, cfg.scaling.min_recent_samples_for_scale);
-    let robust_without_best = positive_excluding_best_trade(&scaling.recent_pnls, cfg.scaling.min_recent_samples_for_scale).unwrap_or(false);
+    let profit_factor = recent_profit_factor(
+        &scaling.recent_pnls,
+        cfg.scaling.min_recent_samples_for_scale,
+    );
+    let robust_without_best = positive_excluding_best_trade(
+        &scaling.recent_pnls,
+        cfg.scaling.min_recent_samples_for_scale,
+    )
+    .unwrap_or(false);
 
     // Gates de CRESCIMENTO — recuperação parcial, drawdown baixo,
     // orçamento livre e diversidade nunca fazem sentido bloquear uma
@@ -1344,24 +1580,38 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
     let can_grow = enough_cycles
         && growth_gates_ok
         && robust_without_best
-        && profit_factor.map(|pf| pf >= cfg.scaling.min_recent_profit_factor_for_scale).unwrap_or(false);
+        && profit_factor
+            .map(|pf| pf >= cfg.scaling.min_recent_profit_factor_for_scale)
+            .unwrap_or(false);
     let should_shrink = enough_cycles
-        && profit_factor.map(|pf| pf < cfg.scaling.min_recent_profit_factor_to_hold).unwrap_or(false);
+        && profit_factor
+            .map(|pf| pf < cfg.scaling.min_recent_profit_factor_to_hold)
+            .unwrap_or(false);
 
     let old_size = scaling.leg_size;
     let new_size = if can_grow {
         let max_leg = equity * cfg.scaling.max_leg_fraction_of_equity;
-        let target_size = kelly_target_size(scaling, cfg, equity).unwrap_or(old_size * cfg.scaling.scale_growth_factor);
+        let target_size = kelly_target_size(scaling, cfg, equity)
+            .unwrap_or(old_size * cfg.scaling.scale_growth_factor);
         target_size.min(max_leg).max(1.0)
     } else if should_shrink {
         (old_size * cfg.scaling.scale_shrink_factor).max(1.0)
     } else {
         tracing::debug!(
             strategy = strategy.key(),
-            recovered, enough_cycles, low_drawdown, robust_without_best,
-            free_budget_ok, not_overconcentrated, distinct_symbols,
+            recovered,
+            enough_cycles,
+            low_drawdown,
+            robust_without_best,
+            free_budget_ok,
+            not_overconcentrated,
+            distinct_symbols,
             profit_factor = profit_factor.unwrap_or(0.0),
-            exposure_utilization = if strategy_limit > 0.0 { current_exposure / strategy_limit } else { 0.0 },
+            exposure_utilization = if strategy_limit > 0.0 {
+                current_exposure / strategy_limit
+            } else {
+                0.0
+            },
             "escalonamento negado — condição de evidência não atendida"
         );
         return Vec::new();
@@ -1380,7 +1630,11 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
         new_leg_size = new_size,
         equity,
         profit_factor = profit_factor.unwrap_or(0.0),
-        acao = if can_grow { "crescimento" } else { "redução ativa por PF degradado" },
+        acao = if can_grow {
+            "crescimento"
+        } else {
+            "redução ativa por PF degradado"
+        },
         "condições de escalonamento atendidas: ajustando perna"
     );
     scaling.leg_size = new_size;
@@ -1388,6 +1642,186 @@ fn maybe_scale(portfolio: &mut PortfolioState, cfg: &RiskConfig, strategy: Strat
         strategy: Some(strategy),
         old_size,
         new_size,
-        direction: if new_size > old_size { ScaleDirection::Increase } else { ScaleDirection::Decrease },
+        direction: if new_size > old_size {
+            ScaleDirection::Increase
+        } else {
+            ScaleDirection::Decrease
+        },
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Direction, ExecutionMode, Market};
+
+    fn config() -> RiskConfig {
+        RiskConfig::load(concat!(env!("CARGO_MANIFEST_DIR"), "/config/risk.toml")).unwrap()
+    }
+
+    fn opportunity(capital_needed: f64, capital_multiplier: f64) -> Opportunity {
+        Opportunity {
+            signal_id: 42,
+            market: Market::Crypto,
+            strategy: Strategy::OrderFlow,
+            asset: "BTCUSDT".to_string(),
+            direction: Direction::Long,
+            net_edge: 0.002,
+            confidence: 0.7,
+            valid_for_ms: 10_000,
+            expected_holding_secs: 5.0,
+            capital_needed,
+            reference_price: Some(100.0),
+            max_loss_pct: 0.001,
+            leverage: 1.0,
+            correlation_group: "BTCUSDT".to_string(),
+            execution_mode: ExecutionMode::ExecutableQuoted,
+            capital_multiplier,
+            emitted_at: Instant::now(),
+        }
+    }
+
+    fn portfolio_with_btc_filter(cfg: &RiskConfig) -> PortfolioState {
+        let mut portfolio = PortfolioState::new(cfg);
+        portfolio.symbol_filters.insert(
+            "bybit:BTCUSDT".to_string(),
+            SymbolFilter {
+                min_qty: 0.001,
+                qty_step: 0.001,
+                min_notional: 5.0,
+                price_tick: 0.1,
+            },
+        );
+        portfolio
+    }
+
+    #[test]
+    fn two_legs_count_twice_against_global_notional() {
+        let cfg = config();
+        let mut portfolio = portfolio_with_btc_filter(&cfg);
+        portfolio
+            .strategy_scaling
+            .get_mut(&Strategy::OrderFlow)
+            .unwrap()
+            .leg_size = 150.0;
+        let result = evaluate(&opportunity(120.0, 2.0), &portfolio, &cfg);
+        assert_eq!(result.unwrap_err(), RejectReason::GlobalLeverageExceeded);
+    }
+
+    #[test]
+    fn observation_only_never_reserves_capital() {
+        let cfg = config();
+        let portfolio = portfolio_with_btc_filter(&cfg);
+        let mut opp = opportunity(25.0, 1.0);
+        opp.execution_mode = ExecutionMode::ObservationOnly;
+        assert_eq!(
+            evaluate(&opp, &portfolio, &cfg).unwrap_err(),
+            RejectReason::ExecutionDisabled
+        );
+    }
+
+    #[test]
+    fn executable_signal_fails_closed_without_bybit_filter() {
+        let cfg = config();
+        let portfolio = PortfolioState::new(&cfg);
+        assert_eq!(
+            evaluate(&opportunity(25.0, 1.0), &portfolio, &cfg).unwrap_err(),
+            RejectReason::MissingExchangeFilter
+        );
+    }
+
+    #[test]
+    fn cancelling_unfilled_releases_every_reservation() {
+        let cfg = config();
+        let mut portfolio = portfolio_with_btc_filter(&cfg);
+        let opp = opportunity(25.0, 1.0);
+        let approved = evaluate(&opp, &portfolio, &cfg).unwrap();
+        open_exposure(&mut portfolio, &opp, &approved);
+        assert!(portfolio.total_exposure() > 0.0);
+        assert!(portfolio.total_leveraged_notional > 0.0);
+        cancel_exposure(&mut portfolio, &opp, &approved);
+        assert_eq!(portfolio.total_exposure(), 0.0);
+        assert_eq!(portfolio.total_leveraged_notional, 0.0);
+    }
+
+    #[test]
+    fn manual_total_drawdown_reset_establishes_new_baseline() {
+        let cfg = config();
+        let mut portfolio = PortfolioState::new(&cfg);
+        portfolio.equity = 180.0;
+        portfolio.peak_equity = 200.0;
+        portfolio.day_start_equity = 180.0;
+        portfolio.week_start_equity = 180.0;
+        portfolio.total_drawdown_latched = true;
+
+        let unique = format!("aurumos-reset-{}", crate::raw_log::now_ms());
+        let reset_path = std::env::temp_dir().join(unique);
+        std::fs::write(&reset_path, b"reset").unwrap();
+        let kill_path = reset_path.with_extension("kill-does-not-exist");
+        let status = kill_switch_reason(
+            &mut portfolio,
+            &cfg,
+            &kill_path.to_string_lossy(),
+            &reset_path.to_string_lossy(),
+        );
+        assert!(status.halt.is_none());
+        assert!(!portfolio.total_drawdown_latched);
+        assert_eq!(portfolio.peak_equity, portfolio.equity);
+        assert!(!reset_path.exists());
+    }
+
+    #[test]
+    fn corrupted_primary_recovers_previous_valid_state() {
+        let cfg = config();
+        let path = std::env::temp_dir().join(format!(
+            "aurumos-state-recovery-{}-{}.json",
+            std::process::id(),
+            crate::raw_log::now_ms()
+        ));
+        let backup = sibling_path(&path, ".prev");
+        let temporary = sibling_path(&path, ".tmp");
+
+        let mut portfolio = PortfolioState::new(&cfg);
+        portfolio.equity = 187.25;
+        portfolio.save(&path.to_string_lossy());
+        portfolio.equity = 181.50;
+        portfolio.save(&path.to_string_lossy());
+        std::fs::write(&path, b"{\"state\":").unwrap();
+
+        let recovered = PortfolioState::load_or_new(&cfg, &path.to_string_lossy());
+        assert_eq!(recovered.equity, 187.25);
+        assert!(backup.exists());
+        assert!(!temporary.exists());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(&temporary);
+    }
+
+    #[test]
+    fn modified_state_is_rejected_when_checksum_does_not_match() {
+        let cfg = config();
+        let path = std::env::temp_dir().join(format!(
+            "aurumos-state-checksum-{}-{}.json",
+            std::process::id(),
+            crate::raw_log::now_ms()
+        ));
+
+        let mut portfolio = PortfolioState::new(&cfg);
+        portfolio.equity = 193.75;
+        portfolio.save(&path.to_string_lossy());
+
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        json["state"]["equity"] = serde_json::json!(999_999.0);
+        std::fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let recovered = PortfolioState::load_or_new(&cfg, &path.to_string_lossy());
+        assert_eq!(recovered.equity, cfg.total_equity_start);
+        assert_ne!(recovered.equity, 999_999.0);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(sibling_path(&path, ".prev"));
+        let _ = std::fs::remove_file(sibling_path(&path, ".tmp"));
+    }
 }

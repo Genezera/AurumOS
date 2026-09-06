@@ -9,7 +9,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration};
 
 use crate::sources::SignalSource;
-use crate::types::{Direction, Market, Opportunity, Strategy};
+use crate::types::{next_signal_id, Direction, ExecutionMode, Market, Opportunity, Strategy};
 
 // Feed Atom oficial de filings recentes — não é push em tempo real (a SEC
 // não oferece WebSocket para isso), então fazemos polling. 45s fica bem
@@ -48,7 +48,10 @@ struct OllamaClassification {
 /// no comportamento neutro de sempre (fallback determinístico, exigido pela
 /// Seção 5 do roadmap — nenhum modelo é obrigatório para o sistema
 /// continuar funcionando).
-async fn classify_with_ollama(client: &reqwest::Client, title: &str) -> Option<OllamaClassification> {
+async fn classify_with_ollama(
+    client: &reqwest::Client,
+    title: &str,
+) -> Option<OllamaClassification> {
     let prompt = format!(
         "Voce e um classificador financeiro objetivo. Dado o titulo de um filing 8-K \
          da SEC, responda APENAS com um JSON no formato {{\"direction\": \"up\" | \"down\" | \"neutral\", \"confidence\": 0.0 a 1.0}}. \
@@ -128,7 +131,10 @@ impl SignalSource for NewsReactorSource {
                         emit(&tx, &client, &entry).await;
                     }
                     if first_poll {
-                        tracing::info!(baseline = seen.len(), "news reactor: linha de base da EDGAR estabelecida");
+                        tracing::info!(
+                            baseline = seen.len(),
+                            "news reactor: linha de base da EDGAR estabelecida"
+                        );
                     } else if new_count > 0 {
                         tracing::info!(new_count, "news reactor: novos filings 8-K detectados");
                     }
@@ -169,7 +175,8 @@ fn parse_atom_entries(xml: &str) -> anyhow::Result<Vec<Entry>> {
                     link.clear();
                 }
                 if in_entry && name == "link" {
-                    if let Some(attr) = e.attributes().flatten().find(|a| a.key.as_ref() == b"href") {
+                    if let Some(attr) = e.attributes().flatten().find(|a| a.key.as_ref() == b"href")
+                    {
                         link = String::from_utf8_lossy(&attr.value).to_string();
                     }
                 }
@@ -185,8 +192,15 @@ fn parse_atom_entries(xml: &str) -> anyhow::Result<Vec<Entry>> {
                 if name == "entry" {
                     in_entry = false;
                     if !title.is_empty() {
-                        let id = if link.is_empty() { title.clone() } else { link.clone() };
-                        entries.push(Entry { id, title: title.clone() });
+                        let id = if link.is_empty() {
+                            title.clone()
+                        } else {
+                            link.clone()
+                        };
+                        entries.push(Entry {
+                            id,
+                            title: title.clone(),
+                        });
                     }
                 }
             }
@@ -208,9 +222,16 @@ async fn emit(tx: &Sender<Opportunity>, client: &reqwest::Client, entry: &Entry)
     // classificação, mantém o comportamento neutro de sempre.
     let (direction, confidence, asset, model_tag) = match &classification {
         Some(c) => {
-            let dir = if c.direction.eq_ignore_ascii_case("down") { Direction::Short } else { Direction::Long };
+            let dir = if c.direction.eq_ignore_ascii_case("down") {
+                Direction::Short
+            } else {
+                Direction::Long
+            };
             let conf = c.confidence.clamp(0.0, 1.0);
-            let asset = format!("{title_short} [{OLLAMA_MODEL}: {} {:.2}]", c.direction, conf);
+            let asset = format!(
+                "{title_short} [{OLLAMA_MODEL}: {} {:.2}]",
+                c.direction, conf
+            );
             (dir, conf.max(0.2), asset, Some(OLLAMA_MODEL))
         }
         None => (Direction::Long, 0.25, title_short, None),
@@ -231,6 +252,7 @@ async fn emit(tx: &Sender<Opportunity>, client: &reqwest::Client, entry: &Entry)
     // ele contar como vantagem numérica de verdade — nenhuma das duas
     // existe ainda, então isso continua 100% informativo.
     let opp = Opportunity {
+        signal_id: next_signal_id(),
         market: Market::Stocks,
         strategy: Strategy::News,
         asset,
@@ -241,10 +263,12 @@ async fn emit(tx: &Sender<Opportunity>, client: &reqwest::Client, entry: &Entry)
         // Informativo (net_edge=0) — placeholder consistente com valid_for_ms.
         expected_holding_secs: 120.0,
         capital_needed: 10.0,
+        reference_price: None,
         max_loss_pct: 0.01,
         leverage: 1.0,
         correlation_group: "news_driven".to_string(),
-        sampled_return: None,
+        execution_mode: ExecutionMode::ObservationOnly,
+        capital_multiplier: 1.0,
         emitted_at: Instant::now(),
     };
     let _ = tx.send(opp).await;

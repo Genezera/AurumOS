@@ -4,161 +4,110 @@
 
 # AurumOS
 
-**Orquestrador multi-estratégia de trading quantitativo — 100% paper trading, dado real, sem mock.**
+**Laboratório quantitativo para uma banca inicial de US$ 200 em uma única corretora.**
 
-![status](https://img.shields.io/badge/status-paper--trading-f5c453?style=flat-square&labelColor=0c1117)
-![linguagem](https://img.shields.io/badge/core-Rust-f5c453?style=flat-square&labelColor=0c1117)
-![capital real](https://img.shields.io/badge/capital%20real-nunca-ff4d67?style=flat-square&labelColor=0c1117)
-![dashboard](https://img.shields.io/badge/dashboard-axum%20%2B%20WebSocket-18d7ff?style=flat-square&labelColor=0c1117)
-![licença](https://img.shields.io/badge/uso-projeto%20pessoal-aab6c3?style=flat-square&labelColor=0c1117)
+![status](https://img.shields.io/badge/status-shadow%20%2B%20Bybit%20Demo-f5c453?style=flat-square&labelColor=0c1117)
+![venue](https://img.shields.io/badge/venue-Bybit%20linear-18d7ff?style=flat-square&labelColor=0c1117)
+![capital real](https://img.shields.io/badge/capital%20real-desativado-ff4d67?style=flat-square&labelColor=0c1117)
+![core](https://img.shields.io/badge/core-Rust-f5c453?style=flat-square&labelColor=0c1117)
 
 </div>
 
----
+## Objetivo
 
-## O que é
+O AurumOS pesquisa operações curtas e repetíveis em perpétuos USDT da Bybit. O scanner acompanha um universo amplo, mas o executor só aloca a banca a uma hipótese que tenha demonstrado retorno líquido no próprio símbolo. A frequência desejada é de segundos; a frequência realizada depende da existência de vantagem depois de spread e taxas.
 
-AurumOS é um orquestrador de trading que roda **9 estratégias independentes em paralelo**, cada uma lendo dado real de mercado (Bybit, Bitget, Ethereum on-chain, SEC EDGAR, Alpaca/IEX), competindo por um orçamento de risco comum através de um motor central de decisão. Nada aqui é simulado ou sintético: os preços, spreads, liquidações, filings e transações on-chain são reais — apenas a execução é em paper trading, sem dinheiro de verdade conectado.
+Não existe método legítimo que garanta transformar US$ 200 em um valor maior em minutos. O software trata crescimento como resultado de uma expectativa líquida comprovada, controle de perda e composição. A velocidade do loop não é usada como substituto de vantagem estatística.
 
-O objetivo não é uma única estratégia "vencedora", e sim um **sistema que decide sozinho onde alocar risco** entre oportunidades de naturezas completamente diferentes — desde arbitragem de milissegundos até eventos macro que acontecem uma vez por mês — usando o mesmo motor de risco, o mesmo sizing e o mesmo kill-switch para todas.
+## Estado atual
 
-> Regra permanente do projeto: **nunca conecta capital real, nunca cria contas em nome do usuário**, independentemente de qualquer autonomia concedida. Todo o histórico de operações abaixo é paper trading.
+- **Uma corretora:** Bybit, mercado linear USDT. A arbitragem Bybit–Bitget foi retirada do runtime porque exigiria capital em duas venues.
+- **Um executor com dois backends:** Microestrutura multi-horizonte de 5, 15, 30 e 60 segundos (`Strategy::OrderFlow`) roda em shadow por padrão e pode enviar ordens exclusivamente à Bybit Demo quando ativada com credenciais Demo.
+- **Sete módulos de inteligência/pesquisa:** Funding Carry, News, Launch, Pump Exhaustion, Whale Watch, Macro e Liquidation Hunter. Eles ampliam a pesquisa, mas não geram PnL nem ordens.
+- **Capital real estruturalmente desligado:** o único hostname autenticado compilado é `api-demo.bybit.com`; não há rota para o endpoint de produção.
 
----
+Os resultados antigos de “Arbitragem +US$ 1.002,79” e “Order Flow +US$ 2.268,81” foram removidos. Eles vinham de reamostragem de retornos históricos e não correspondiam aos fills da oportunidade contabilizada.
 
-## Arquitetura
+O projeto Snowball foi auditado e parcialmente incorporado. A ideia aproveitada foi o cash-and-carry spot+perp dentro da própria Bybit; o motor de duas corretoras, os saldos paper e as premissas de fill maker não foram importados. O novo radar usa bid/ask e tamanho L1 das quatro pontas, turnover das duas pernas, `fundingIntervalHour`, `nextFundingTime` e histórico de funding efetivamente liquidado. Ele permanece bloqueado para execução até existir histórico forward e um executor reconciliado de duas pernas. Veja [`docs/audit_2026_09_06/COMPARACAO_SNOWBALL_E_INTEGRACAO.md`](docs/audit_2026_09_06/COMPARACAO_SNOWBALL_E_INTEGRACAO.md).
 
-```
-                        ┌─────────────────────────────────────────┐
-                        │            9 SignalSource                │
-                        │  (cada um lê dado real, emite            │
-                        │   Opportunity num canal async comum)     │
-                        └───────────────────┬───────────────────────┘
-                                             │ mpsc::Sender<Opportunity>
-                                             ▼
-                        ┌─────────────────────────────────────────┐
-                        │   Orquestrador (orchestrator.rs)          │
-                        │   • motor de confluência (fusion.rs)      │
-                        │   • scorer por velocidade/edge             │
-                        │   • concorrência por orçamento de risco    │
-                        └───────────────────┬───────────────────────┘
-                                             │
-                        ┌────────────────────┴────────────────────┐
-                        ▼                                          ▼
-        ┌───────────────────────────┐            ┌───────────────────────────┐
-        │  Motor de risco (risk.rs)  │            │  EventBus (events.rs)     │
-        │  • Kelly hierárquico        │            │  • backlog + replay ao     │
-        │  • kill-switch em 4 camadas │            │    vivo via WebSocket      │
-        │  • escalonamento por        │            │  • persistido em JSONL     │
-        │    estratégia/símbolo       │            └─────────────┬─────────────┘
-        └─────────────────────────────┘                          ▼
-                                                    ┌───────────────────────────┐
-                                                    │  Dashboard (axum)          │
-                                                    │  http://127.0.0.1:7878     │
-                                                    └───────────────────────────┘
-```
+Estado e eventos usam arquivos separados por backend. O sinal OFI dinâmico usa histórico/ranking `microstructure_v9`; resultados dos modelos anteriores permanecem como baseline e não entram na decisão atual. A v9 forma a janela exclusivamente com `cts`/`T` do matching engine, guarda junto de cada retorno a força do sinal, OFI, agressão, notional negociado, fila e spread, e publica coortes de pesquisa que não autorizam ordens.
 
-Cada módulo implementa o mesmo contrato (`trait SignalSource` em [`sources/mod.rs`](orchestrator/src/sources/mod.rs)): lê dado real, emite `Opportunity`, nunca decide sozinho se executa. Toda decisão de execução, sizing e corte por risco passa por um único motor central — isso é o que permite comparar uma oportunidade de arbitragem de 3 segundos com um sinal de whale watch que dura horas usando a mesma régua.
+## Como uma operação shadow nasce
 
----
+1. O feed recebe cada alteração do melhor bid/ask e os negócios públicos de um perpétuo.
+2. O scanner calcula OFI dinâmico a partir de mudanças de preço/quantidade causadas por ordens e cancelamentos, exigindo alinhamento com a agressão negociada, book recente e profundidade mínima.
+3. A entrada é marcada no ask para long ou no bid para short.
+4. A saída é marcada no lado oposto do book em 5, 15, 30 e 60 segundos.
+5. O retorno aplica a classe pública atual do contrato: 0,055% taker por lado em Major/Altcoin, 0,10% em pré-listagem e 0,11% na Innovation Zone. Símbolo sem classificação usa 0,11%; TradFi não entra no universo cripto.
+6. Cada candidato alimenta separadamente o histórico do próprio símbolo+horizonte. Janelas sobrepostas da mesma combinação são bloqueadas.
+7. A combinação só fica executável depois de 200 amostras válidas. A série é dividida cronologicamente entre treino e validação; o menor LCB95, inclusive após remover o melhor trade da validação, precisa exceder 0,01% líquido.
+8. O resultado carrega o mesmo `signal_id` da oportunidade. Sem relatório correspondente, a reserva expira como `unfilled` e o PnL permanece inalterado.
 
-## As 9 estratégias
+No modo shadow, bid/ask público não prova fill real, latência do gateway ou slippage além do topo. O backend Demo mede esses itens pelos fills da conta de teste: abre uma ordem market com tolerância de slippage, instala um stop market de posição inteira na venue, espera o horizonte aprovado de 5 a 60 segundos, fecha com `reduceOnly` e calcula o PnL absoluto por `execValue` e `execFee`. Se o stop não puder ser confirmado, tenta zerar imediatamente. Se o estado ficar incerto, a exposição permanece reservada e novas ordens são bloqueadas.
 
-Só 3 delas conseguem executar trade de verdade — as outras 6 são estruturalmente informativas: emitem `net_edge = 0.0` sempre, o que faz `score()` ser sempre zero, e `pick_best()` descarta qualquer candidato com score ≤ 0 antes mesmo de chegar no motor de risco. Não é uma convenção, é garantido em código.
+## Banca e risco
 
-| Estratégia | Caminho | Fonte de dado | O que captura |
-|---|---|---|---|
-| **Arbitragem** | Executa | Book Bybit ↔ Bitget (spot) | Divergência de preço executável entre exchanges |
-| **Order Flow** | Executa | Book Bybit (spot) | Captura de spread como market maker |
-| **Pump Exhaustion** | Executa* | Funding + OI + liquidações da Bybit (perpétuos) | Exaustão de movimento (fusão de whale watch on-chain + liquidation hunter) |
-| **Whale Watch** | Observação | On-chain Ethereum (Transfer USDT/USDC) | Movimentação de grandes carteiras rotuladas |
-| **Liquidation Hunter** | Observação | `allLiquidation` da Bybit | Cascatas de liquidação em perpétuos |
-| **News Reactor** | Observação | SEC EDGAR (filings 8-K ao vivo) + LLM local (Ollama) | Reação a eventos corporativos classificados por IA local, sem chave, sem custo |
-| **Launch Radar** | Observação (trava estrutural adicional) | Bybit `instruments-info` + `PairCreated` Uniswap V2 | Novos listings CEX/DEX, com checklist de holders/LP |
-| **Macro Engine** | Observação | Calendário oficial FOMC/CPI/NFP | Janelas de volatilidade em torno de eventos macro |
-| **Multi-Asset** | Observação | Alpaca (IEX) | Ações via feed gratuito, idle até o usuário fornecer chave própria |
+A configuração inicial fica em [`orchestrator/config/risk.toml`](orchestrator/config/risk.toml):
 
-*Pump Exhaustion tem a mesma camada de confirmação de preço real, taxa de execução descontada e reamostragem por bootstrap que Arbitragem/Order Flow já usam — mas ainda não acumulou amostra suficiente pra sair de `net_edge=0.0`: 0 trades executados até agora.
+| Regra | Valor inicial |
+|---|---:|
+| Equity operacional | US$ 200 |
+| Notional pretendido por operação | até US$ 25 |
+| Alavancagem do executor | 1x |
+| Risco simultâneo total | 0,50% da equity |
+| Aviso de perda diária | 1,00% |
+| Bloqueio diário | 1,50% |
+| Bloqueio semanal | 4,00% |
+| Bloqueio desde o pico | 7,00% |
 
-Whale Watch e Liquidation Hunter foram fundidos operacionalmente ao Pump Exhaustion — três fontes de dado independentes alimentando um único sinal de exaustão, em vez de três estratégias competindo pelo mesmo risco.
+O sizing arredonda a quantidade pelo `qtyStep`, verifica `minOrderQty` e `minNotionalValue` obtidos do endpoint oficial de instrumentos. O reset manual do drawdown cria uma nova linha de base; ele não religa imediatamente a mesma trava. Resultados `unfilled` liberam toda a exposição sem alimentar wins, losses ou Kelly.
 
----
+## Arquitetura de uma operação profissional
 
-## Motor de risco
-
-- **Exposição simultânea real**: posições ficam genuinamente reservadas entre a aprovação e a resolução (30s Order Flow, 2s Arbitragem, 20min Pump Exhaustion) — não mais round-trip instantâneo. Os limites de risco por estratégia/grupo/portfólio agora bloqueiam por excesso SIMULTÂNEO de verdade, não só por um trade grande demais sozinho.
-- **Kelly hierárquico** (portfólio → estratégia → símbolo): a fração de capital por operação é ponderada pelo histórico de PnL em cada nível, com blend automático conforme a amostra por símbolo cresce. A taxa de acerto usada no cálculo é o limite inferior de confiança de Wilson (95%), não o valor pontual — menos sujeito a excesso de confiança em amostra pequena. Símbolos da mesma estratégia são normalizados entre si pra não reivindicarem 2x cada simultaneamente.
-- **Hierarquia de profit factor**: PF ≥ 1,3 autoriza crescer a perna; PF < 1,2 força uma redução ativa; entre os dois, mantém o tamanho atual.
-- **Gate de escalonamento por evidência**: crescer também exige orçamento de risco livre (< 50% do limite da estratégia em uso) e diversidade de símbolos (lucro vindo de pelo menos 2 símbolos distintos), além do piso de tempo/ciclos.
-- **Teto global de alavancagem**: soma do notional alavancado de todas as posições abertas, dividido pelo equity, nunca passa de 1,0x configurado (2,0x é o teto absoluto no código, não editável).
-- **Escalonamento não-destrutivo por drawdown**: em vez de reduzir o tamanho da perna permanentemente a cada operação em drawdown, um teto (`drawdown_ceiling_multiplier`) recalculado a cada ciclo aplica a redução como multiplicador — sem colapsar o sizing ao piso.
-- **Recuperação parcial (80%)**: escalonar de volta para cima não exige recuperar 100% do pico de equity, só 80% da queda desde o pico.
-- **Kill-switch em 4 camadas**: aviso preventivo (1% diário, reduz perna pela metade), bloqueio rígido diário (1,5%), bloqueio semanal (4%), bloqueio total por drawdown histórico (7%, exige reset manual). Só bloqueia NOVAS aberturas — posições já abertas resolvem sozinhas no prazo natural (no máximo 30s hoje).
-- **Rate limiter real por venue**: token bucket (8 requisições/s), simulando o limite de uma conta de varejo comum — consumido só quando uma ordem é de fato aberta.
-- **Notional mínimo real por símbolo**: buscado ao vivo da própria API pública da exchange no boot (Bybit e Bitget); ordem abaixo do mínimo real é rejeitada.
-- **Reamostragem por bootstrap**: o resultado de cada trade (Arbitragem, Order Flow, Pump Exhaustion) é sorteado de um desfecho REAL já confirmado contra preço, não de uma fórmula `confidence×net_edge`.
-- **Deduplicação de sinais sobrepostos**: janelas de confirmação sobrepostas do mesmo símbolo não contam como amostras independentes — só uma confirmação em voo por símbolo por vez.
-- **Trava estrutural do Launch Radar**: independente do gate de score (que já bloqueia por net_edge=0), uma flag no código impede execução de lançamentos de token — o contexto de menor liquidez do sistema.
-- **Concorrência por orçamento de risco**: sem tabela fixa de "N trades simultâneos por faixa de capital" — o motor de correlação e risco total (`risk::evaluate`) decide, reavaliado a cada ciclo.
-- **Universo de símbolos dinâmico**: rotação a cada 15 minutos por todo o mercado disponível (perpétuos e spot separadamente), ranqueado por edge observado, com refresh de exibição a cada 5 segundos.
-
-Todo o estado de risco (posições, PnL por estratégia/símbolo, edge scores por símbolo, histórico de confirmação de preço) é persistido em disco e recarregado no boot — reiniciar o processo não zera o progresso acumulado.
-
----
-
-## Dashboard
-
-Servidor axum embutido no próprio binário, servindo um frontend vanilla JS/HTML (sem framework) com o brand kit oficial do AurumOS. WebSocket com replay de backlog completo ao conectar — abrir o dashboard nunca perde histórico.
-
-```
-http://127.0.0.1:7878
+```text
+Market Data       Bybit book + public trades + sensores externos
+      ↓
+Research          amostra por símbolo, custo completo, LCB95, logs brutos
+      ↓
+Strategy          microestrutura direcional com janelas de 5/15/30/60 segundos
+      ↓
+Portfolio/Risk    sizing, limites simultâneos, drawdown, rate limit, lote
+      ↓
+Execution         shadow ou Bybit Demo; signal_id → ordem/fill → resultado
+      ↓
+Accounting        equity, reservas, exposição e histórico persistente
+      ↓
+Monitoring        dashboard, heartbeats, eventos e kill-switch
 ```
 
-Painéis: pulso por estratégia (com sparkline de PnL para as que já operaram, e explicação honesta de por que as outras ainda estão dormentes), cockpit de risco (kill-switch, drawdown, parada manual), exposição em tempo real por estratégia, universo de símbolos ao vivo com edge ranqueado, feed de eventos.
+Os sensores cobrem mais mercados; o executor permanece estreito. Uma banca de US$ 200 não consegue operar o “universo inteiro” com qualidade ao mesmo tempo, mas consegue pesquisar amplamente e concentrar capital onde a evidência líquida é melhor.
 
----
+## Executar
 
-## Como rodar
-
-```bash
-# build (a partir da raiz do repositório)
-cargo build --release
-
-# executar (precisa rodar de dentro de orchestrator/, onde fica config/risk.toml)
-cd orchestrator
-../target/release/orchestrator.exe
+```powershell
+cargo test --locked
+cargo run --locked -p orchestrator
 ```
 
-Variáveis de ambiente opcionais (tudo tem fallback público/gratuito se omitido):
+O padrão é shadow. Para usar uma conta de teste, copie [`orchestrator/.env.example`](orchestrator/.env.example) para `orchestrator/.env`, defina `AURUMOS_EXECUTION_MODE=demo` e informe chaves criadas no ambiente Bybit Demo. No boot, o processo sincroniza o relógio, exige pelo menos US$ 200 disponíveis e recusa contas com posições ou ordens lineares abertas. Antes de cada entrada, confirma modo one-way e alavancagem 1x no símbolo. A contabilidade local continua limitada à banca inicial de US$ 200, mesmo que o saldo fictício da conta Demo seja maior.
 
-| Variável | Módulo | Padrão sem ela |
-|---|---|---|
-| `AURUMOS_ETH_WS_URL` / `AURUMOS_ETH_HTTP_URL` | Whale Watch, Launch Radar DEX | Nó RPC público (publicnode.com) |
-| `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY` | Multi-Asset | Módulo fica idle |
+Dashboard: `http://127.0.0.1:7878`.
 
-**Ollama local** (opcional, não é variável de ambiente): News Reactor usa `llama3.2:3b` via `http://localhost:11434` pra classificar filings da SEC. Sem o Ollama rodando, cai num fallback neutro determinístico — nunca inventa uma direção, só fica sem a classificação real.
+O relatório vivo do radar de carry fica em `orchestrator/data/funding_carry_validation_v1.json`; as observações completas ficam em `orchestrator/data/raw_funding_carry_bybit.jsonl`. Previsões congeladas até 30 minutos antes do funding e a posterior taxa liquidada são mantidas no WAL `orchestrator/data/funding_carry_forward_v1.jsonl`. Os três arquivos são pesquisa, não autorização de ordem.
 
-**Kill-switch manual**: criar o arquivo `orchestrator/data/KILL` (qualquer conteúdo) pausa novas execuções; apagar retoma. Não cancela posições já abertas — elas resolvem sozinhas no prazo natural (no máximo 30s hoje).
+O arquivo `orchestrator/data/KILL` pausa novas aberturas. O arquivo `orchestrator/data/RESET_DRAWDOWN_HALT` reconhece e redefine a linha de base da trava de drawdown total.
 
----
+Em paralelo, `strategy_validation_maker_entry_v3.json` mede uma alternativa de menor custo sem enviar ordens: assume 250 ms de latência de colocação, exige que o preço ainda seja o melhor nível na chegada e só conta fill quando negócios públicos futuros consomem a fila visível inteira e a ordem de US$ 25 até 500 ms após o sinal; a saída permanece taker. Esse relatório mantém `execution_enabled=false` mesmo se uma coorte passar o portão de pesquisa.
 
-## Estrutura do repositório
+## Critérios para avançar
 
-```
-orchestrator/          núcleo Rust — orquestrador, motor de risco, dashboard, 9 fontes de sinal
-  src/sources/          um módulo por estratégia, todos implementando SignalSource
-  config/risk.toml       toda a configuração de capital e risco, documentada inline
-  dashboard/             frontend vanilla JS/HTML embutido no binário
-backtests/              scripts Python de análise sobre dado real coletado (events.jsonl, raw logs)
-docs/                   gerador do roadmap técnico (generate_roadmap.py, reportlab) + brand kit
-```
+1. Coletar amostras em dias, horários e regimes diferentes.
+2. Preservar o corte temporal de treino/validação já implantado e reservar um teste final nunca usado para escolher limiares.
+3. Confirmar retorno líquido positivo, LCB95 positivo, drawdown compatível e estabilidade sem o melhor trade em vários regimes.
+4. Executar uma campanha na Bybit Demo; o adaptador com IDs idempotentes, fills, posição e reconciliação já está implantado.
+5. Comparar shadow e Demo por fill, preço e latência e guardar o teste final sem ajuste posterior.
+6. Qualquer decisão futura sobre capital real deve ser explícita e posterior a essa validação; o binário atual não contém endpoint real.
 
-O roadmap técnico completo (arquitetura detalhada, histórico de auditorias, bugs encontrados e corrigidos, próximos passos) é gerado localmente a partir de `docs/generate_roadmap.py` e não é versionado neste repositório — rode o script para obter a versão mais atual em PDF.
+Documentação oficial usada no modelo: [taxas da Bybit](https://www.bybit.com/en/help-center/article/Trading-Fee-Structure), [grupos públicos de contratos](https://bybit-exchange.github.io/docs/v5/market/fee-group-info), [tickers spot/linear](https://bybit-exchange.github.io/docs/v5/market/tickers), [instrumentos e intervalo de funding](https://bybit-exchange.github.io/docs/v5/market/instrument), [histórico de funding liquidado](https://bybit-exchange.github.io/docs/v5/market/history-fund-rate), [orderbook WebSocket](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook), [public trades](https://bybit-exchange.github.io/docs/v5/websocket/public/trade), [ambiente Demo](https://bybit-exchange.github.io/docs/v5/demo), [criação de ordens](https://bybit-exchange.github.io/docs/v5/order/create-order), [modo da posição](https://bybit-exchange.github.io/docs/v5/position/position-mode), [alavancagem](https://bybit-exchange.github.io/docs/v5/position/leverage), [stop da posição](https://bybit-exchange.github.io/docs/v5/position/trading-stop), [histórico de execuções](https://bybit-exchange.github.io/docs/v5/order/execution), [posições](https://bybit-exchange.github.io/docs/v5/position) e [saldo](https://bybit-exchange.github.io/docs/v5/account/wallet-balance).
 
----
-
-## Estado do projeto
-
-Projeto pessoal, em desenvolvimento ativo e solo. Cada estratégia evolui de "instrumentada" para "confiável" com base em dado real acumulado em paper trading — não existe atalho de engenharia para a passagem de tempo que isso exige. Bugs reais já encontrados e corrigidos incluem corrupção de eventos concorrentes, erros de cálculo de breakeven, universos de símbolos incompatíveis com a exchange conectada, redução de risco destrutiva sob drawdown, um book congelado da Bitget sendo tratado como cotação executável (gerando "100% de acerto" falso num símbolo), e um deadlock de correlação que travava o sistema inteiro assim que a exposição simultânea passou a ser real — cada um documentado no histórico de commits no momento em que foi corrigido.
-
-Resultado numérico mais recente (todo o histórico acumulado, não uma janela limpa pós-correção): Arbitragem 87,9% de acerto / +US$1.002,79, Order Flow 90,9% / +US$2.268,81, Pump Exhaustion ainda sem trade (acumulando amostra). Ver o PDF (`docs/generate_roadmap.py`) para o detalhamento completo, inclusive o aviso honesto de que esse número mistura código antigo (menos realista) com o mais recente.
+O diagnóstico completo e o relatório de remediação estão em [`docs/audit_2026_09_05/RELATORIO_AUDITORIA.md`](docs/audit_2026_09_05/RELATORIO_AUDITORIA.md).

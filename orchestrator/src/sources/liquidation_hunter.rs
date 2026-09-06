@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::events::{DashboardEvent, EventBus};
 use crate::fusion::{record_cascade, LiquidationBoard};
 use crate::sources::SignalSource;
-use crate::types::{Direction, Market, Opportunity, Strategy};
+use crate::types::{next_signal_id, Direction, ExecutionMode, Market, Opportunity, Strategy};
 
 const BYBIT_LINEAR_WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const CHUNK_SIZE: usize = 10;
@@ -52,8 +52,16 @@ pub struct LiquidationHunterSource {
 }
 
 impl LiquidationHunterSource {
-    pub fn new(symbols_rx: watch::Receiver<Vec<String>>, bus: EventBus, liquidation_board: LiquidationBoard) -> Self {
-        Self { symbols_rx, bus, liquidation_board }
+    pub fn new(
+        symbols_rx: watch::Receiver<Vec<String>>,
+        bus: EventBus,
+        liquidation_board: LiquidationBoard,
+    ) -> Self {
+        Self {
+            symbols_rx,
+            bus,
+            liquidation_board,
+        }
     }
 }
 
@@ -81,16 +89,31 @@ impl SignalSource for LiquidationHunterSource {
     }
 }
 
-async fn run_once(symbols: &[String], tx: &Sender<Opportunity>, bus: &EventBus, liquidation_board: &LiquidationBoard) -> anyhow::Result<()> {
+async fn run_once(
+    symbols: &[String],
+    tx: &Sender<Opportunity>,
+    bus: &EventBus,
+    liquidation_board: &LiquidationBoard,
+) -> anyhow::Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(BYBIT_LINEAR_WS_URL).await?;
     let (mut sink, mut stream) = ws.split();
 
-    let args: Vec<String> = symbols.iter().map(|s| format!("allLiquidation.{s}")).collect();
+    let args: Vec<String> = symbols
+        .iter()
+        .map(|s| format!("allLiquidation.{s}"))
+        .collect();
     for chunk in args.chunks(CHUNK_SIZE) {
-        sink.send(WsMessage::Text(serde_json::json!({ "op": "subscribe", "args": chunk }).to_string()))
-            .await?;
+        sink.send(WsMessage::Text(
+            serde_json::json!({ "op": "subscribe", "args": chunk }).to_string(),
+        ))
+        .await?;
     }
-    tracing::info!(exchange = "bybit_linear", ?symbols, lotes = args.len().div_ceil(CHUNK_SIZE), "liquidation hunter: assinatura enviada");
+    tracing::info!(
+        exchange = "bybit_linear",
+        symbols = symbols.len(),
+        lotes = args.len().div_ceil(CHUNK_SIZE),
+        "liquidation hunter: assinatura enviada"
+    );
 
     let mut windows: HashMap<String, VecDeque<LiqEvent>> = HashMap::new();
     let mut last_emitted: HashMap<String, Instant> = HashMap::new();
@@ -162,8 +185,12 @@ async fn handle_message(
 
     let mut count = 0u64;
     for entry in entries {
-        let Some(symbol) = entry.get("s").and_then(Value::as_str) else { continue };
-        let Some(side_str) = entry.get("S").and_then(Value::as_str) else { continue };
+        let Some(symbol) = entry.get("s").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(side_str) = entry.get("S").and_then(Value::as_str) else {
+            continue;
+        };
         let Some(size) = entry
             .get("v")
             .and_then(Value::as_str)
@@ -184,13 +211,25 @@ async fn handle_message(
         count += 1;
 
         let window = windows.entry(symbol.to_string()).or_default();
-        window.push_back(LiqEvent { at: Instant::now(), side, notional_usd });
-        while window.front().map(|e| e.at.elapsed() > CASCADE_WINDOW).unwrap_or(false) {
+        window.push_back(LiqEvent {
+            at: Instant::now(),
+            side,
+            notional_usd,
+        });
+        while window
+            .front()
+            .map(|e| e.at.elapsed() > CASCADE_WINDOW)
+            .unwrap_or(false)
+        {
             window.pop_front();
         }
 
         let same_side_count = window.iter().filter(|e| e.side == side).count();
-        let same_side_notional: f64 = window.iter().filter(|e| e.side == side).map(|e| e.notional_usd).sum();
+        let same_side_notional: f64 = window
+            .iter()
+            .filter(|e| e.side == side)
+            .map(|e| e.notional_usd)
+            .sum();
 
         if same_side_count < CASCADE_MIN_COUNT || same_side_notional < CASCADE_MIN_NOTIONAL_USD {
             continue;
@@ -204,10 +243,10 @@ async fn handle_message(
         last_emitted.insert(symbol.to_string(), Instant::now());
 
         let liquidated_longs = side; // Buy = posição comprada sendo liquidada
-        // Comunica pro Pump Exhaustion via quadro compartilhado — pedido do
-        // usuário de "fazer intercomunicação": uma cascata de liquidação de
-        // longs no mesmo símbolo é um dos três sinais do exemplo de fusão
-        // ("liquidações compradoras crescendo = candidato forte de exaustão").
+                                     // Comunica pro Pump Exhaustion via quadro compartilhado — pedido do
+                                     // usuário de "fazer intercomunicação": uma cascata de liquidação de
+                                     // longs no mesmo símbolo é um dos três sinais do exemplo de fusão
+                                     // ("liquidações compradoras crescendo = candidato forte de exaustão").
         record_cascade(liquidation_board, symbol, liquidated_longs, same_side_count);
         tracing::info!(
             symbol,
@@ -218,6 +257,7 @@ async fn handle_message(
         );
 
         let opp = Opportunity {
+            signal_id: next_signal_id(),
             market: Market::Crypto,
             strategy: Strategy::LiquidationHunter,
             asset: format!(
@@ -229,17 +269,23 @@ async fn handle_message(
             // possível continuação de alta forçada (Short como contra-sinal
             // não modelado aqui — mantemos Long/Short espelhando o lado
             // liquidado, já que é isso que o preço acabou de fazer).
-            direction: if liquidated_longs { Direction::Long } else { Direction::Short },
+            direction: if liquidated_longs {
+                Direction::Long
+            } else {
+                Direction::Short
+            },
             net_edge: 0.0,
             confidence: 0.3,
             valid_for_ms: 45_000,
             // Informativo (net_edge=0) — placeholder consistente com valid_for_ms.
             expected_holding_secs: 45.0,
             capital_needed: 10.0,
+            reference_price: None,
             max_loss_pct: 0.02,
             leverage: 1.0,
             correlation_group: "altcoins".to_string(),
-            sampled_return: None,
+            execution_mode: ExecutionMode::ObservationOnly,
+            capital_multiplier: 1.0,
             emitted_at: Instant::now(),
         };
         let _ = tx.send(opp).await;

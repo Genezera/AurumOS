@@ -30,7 +30,7 @@ fn rendered_index() -> &'static str {
 
 /// Sobe o servidor do painel em `addr` e nunca retorna enquanto o processo
 /// estiver rodando. Roda em sua própria task, independente do loop do
-/// orquestrador — se o dashboard cair, o paper trading continua.
+/// orquestrador — se o dashboard cair, o backend selecionado continua.
 pub async fn serve(addr: SocketAddr, bus: EventBus) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index))
@@ -100,7 +100,10 @@ async fn handle_socket(mut socket: WebSocket, bus: EventBus) {
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::debug!(skipped, "cliente do dashboard ficou para trás, pulando eventos");
+                tracing::debug!(
+                    skipped,
+                    "cliente do dashboard ficou para trás, pulando eventos"
+                );
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => return,
