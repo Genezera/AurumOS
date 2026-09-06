@@ -36,6 +36,58 @@
 4. Quando uma série taker passar automaticamente o LCB95, acompanhar a primeira campanha Demo por fill real, `execFee`, slippage, stop e reconciliação. O PnL local só muda a partir desses fills.
 5. Se nenhum horizonte superar o custo, testar uma nova hipótese separada, como OFI multinível ou TTLs maker pré-registrados, em novo schema; não reduzir amostra mínima nem apagar taxas para forçar operações.
 
+### Leitura antecipada da v9 (Claude Code, 06/09 ~17h) — decomposição spread vs. previsão
+
+Enquanto a coleta v9 ainda estava fina (3.506 amostras, maior série 39/200, nenhum
+gate elegível), esta sessão fez uma análise **agregada** (todos os símbolos juntos)
+só para saber se o sinal novo tem poder preditivo — não para promover nada.
+
+Verificação de integridade primeiro: 532 séries no histórico bruto batem com 532
+linhas no relatório, zero divergência de contagem; 3.506 amostras, nenhuma com taxa
+implícita ≤ 0; as taxas implícitas observadas são exatamente 0,11% e 0,22%,
+confirmando que a classificação por classe pública de taxa está sendo aplicada de
+verdade sobre dado real (Innovation Zone cobrada em dobro, como deveria).
+
+Decomposição (mid ≈ retorno bruto + spread cruzado, já que a entrada cruza o book):
+
+| Horizonte | n | Spread médio | Bruto | Mid-a-mid | LCB95 mid | t |
+|---|---:|---:|---:|---:|---:|---:|
+| 5s | 1.510 | 0,0352% | −0,0200% | **+0,0152%** | +0,0090% | 4,84 |
+| 15s | 1.034 | 0,0381% | −0,0326% | +0,0056% | −0,0043% | 1,10 |
+| 30s | 768 | 0,0397% | −0,0251% | +0,0146% | +0,0001% | 1,97 |
+| 60s | 532 | 0,0416% | −0,0173% | +0,0243% | +0,0008% | 2,03 |
+
+**O sinal OFI prevê de verdade.** O bruto negativo era o spread, não erro de direção:
+em 5s o movimento do mid é +0,0152% com LCB95 positivo e t=4,84. O problema é de
+magnitude: o custo taker é ~0,145% (0,035% spread + 0,11% taxa) e mesmo o melhor caso
+maker-entrada/taker-saída fica em ~0,09%. O sinal entrega ~1/6 a 1/10 do necessário.
+
+Coortes por força do sinal (5s / 60s), para testar se sinal forte prevê mais:
+
+| Faixa de força | mid 5s | t | mid 60s | t |
+|---|---:|---:|---:|---:|
+| 0,0–0,3 | +0,0177% | 3,72 | +0,0341% | 1,74 |
+| 0,3–0,5 | +0,0205% | 4,50 | +0,0248% | 1,55 |
+| 0,5–0,7 | +0,0015% | 0,20 | +0,0399% | 1,65 |
+| 0,7–0,9 | +0,0265% | 4,30 | +0,0305% | 2,12 |
+| 0,9–1,0 | −0,0003% | −0,01 | −0,2066% (n=23) | −1,29 |
+
+**Não há relação monotônica entre força e movimento previsto** — a faixa mais fraca
+prevê tanto quanto a mais forte, e o teto de magnitude fica em ~0,02–0,03% em toda
+coorte. A coorte "força ≥0,90 a 60s" que parecia promissora no snapshot v8 com seis
+observações aparece agora em −0,21% com 23: miragem de amostra pequena, exatamente
+como se temia ao não mexer nos limiares na época.
+
+Ressalvas honestas: isto é agregado (o gate real é por símbolo+horizonte, e um
+símbolo isolado ainda poderia destoar); as coortes foram fatiadas depois de ver o
+dado, então servem como **geração de hipótese, não validação** — o caminho correto
+continua sendo o item 2 acima (pré-registrar e testar em período novo e intocado).
+
+Implicação para o item 5: a evidência inicial aponta para um gap **estrutural** de
+magnitude (sinal ~6–10× menor que o custo), não para um problema de ajuste fino de
+limiar ou de escolha de horizonte. Trocar taker por maker reduz o custo, mas não
+fecha uma lacuna dessa ordem sozinha.
+
 ### Continuação (Claude Code) — revisão de correção em 7 ângulos + correções aplicadas
 
 Com o Codex parado, esta sessão rodou uma revisão multi-ângulo (linha-por-linha, comportamento removido, rastreamento cross-file, reuso, simplificação, eficiência, altitude) sobre o núcleo de execução (`main.rs`, `orchestrator.rs`, `risk.rs`, `types.rs`, `bybit_demo.rs`, `events.rs`, `sources/order_flow.rs`, `sources/funding_carry.rs`, `exchange_filters.rs`, `config/risk.toml`), verificou cada achado manualmente (lendo o código atual e, num caso, a API pública real da Bybit) e corrigiu os confirmados. `orchestrator.exe` (PID ao vivo) nunca foi tocado — os efeitos só valem no próximo restart.
